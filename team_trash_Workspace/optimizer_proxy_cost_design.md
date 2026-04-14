@@ -698,3 +698,148 @@ combined search_score
 ```
 
 This keeps the framework compatible with future simulated annealing, local search, or hybrid optimizers without redesigning the cost path.
+
+## Implementation Status: GPU Batched SA Placer
+
+Date: 2026-04-14.
+
+The first complete implementation was added under `team_trash_Workspace/sa_gpu` without modifying the main project package.
+
+Implemented files:
+
+```text
+sa_gpu/placer.py
+sa_gpu/benchmark_context.py
+sa_gpu/torch_objective.py
+sa_gpu/sa_optimizer.py
+sa_gpu/legalize.py
+sa_gpu/parallel_runner.py
+sa_gpu/tests/test_sa_gpu_smoke.py
+sa_gpu/README.md
+sa_gpu/README_zh.md
+```
+
+The implementation follows the original design:
+
+```text
+official_proxy = wirelength + 0.5 * density + 0.5 * congestion
+search_score   = official_proxy + legality_penalty
+```
+
+Main implemented features:
+
+- Multi-seed state batch inside one optimizer run.
+- Batched candidates per seed.
+- Torch GPU wirelength, overlap, density, and congestion proxy.
+- CUDA fallback to CPU when CUDA is unavailable.
+- Benchmark-level parallel runner with optional device rotation.
+- Final score reporting through official `compute_proxy_cost`.
+
+Important implementation details:
+
+- `SAGPUPlacer` is defined directly in `placer.py` because the official loader checks that the class module matches the file stem.
+- `benchmark_context.py` reloads `PlacementCost` to access net, pin, port, grid, and routing data. Wirelength normalization uses `plc.net_cnt`.
+- Macro pin coordinates are recomputed from `parent_macro_xy + pin_offset` instead of using stale pin positions.
+- Congestion is intentionally a search proxy. The first version uses source-to-sink L routing for all routing pairs and does not exactly reproduce every official 3-pin branch case.
+
+## Implementation And Simulation Issues
+
+The following issues were found while implementing and running full-benchmark simulations:
+
+1. `uv run` kept restoring CPU torch after a manual CUDA wheel install.
+
+   Cause: the lockfile still resolved CPU torch. Manual wheel installation was not enough because `uv run` synchronizes the environment from `uv.lock`.
+
+   Fix: regenerate `uv.lock` with the PyTorch CUDA wheel index. Verified environment:
+
+   ```text
+   torch = 2.11.0+cu128
+   torch.version.cuda = 12.8
+   torch.cuda.is_available() = True
+   GPU = NVIDIA GeForce RTX 4060 Laptop GPU
+   ```
+
+2. Full CPU simulation was too slow for iteration.
+
+   The early full `--all` run on CPU was stopped before completion. Full validation was moved to CUDA.
+
+3. Dense congestion tensors were too memory-risky.
+
+   The first CUDA congestion implementation expanded routing demand into a dense `[batch, routing_pair, row, col]` tensor. This can be too large on later IBM benchmarks.
+
+   Fix: accumulate routing demand in chunks of 512 routing pairs. This keeps the same vectorized GPU computation within each chunk while reducing peak memory.
+
+4. Runner output was too fragile for long full runs.
+
+   The original runner wrote the JSONL output only after all benchmarks finished. If a later benchmark failed, completed results were lost.
+
+   Fix: write each benchmark result incrementally and record per-benchmark errors instead of failing the whole run silently.
+
+5. Torch legality and official overlap metrics were not identical.
+
+   Early results sometimes had `validate_placement == True` but official `compute_proxy_cost` reported nonzero overlap count. The final returned placement now always goes through an additional legalization pass.
+
+6. Shelf-packing fallback ignored fixed macros.
+
+   The fallback legalizer originally packed movable macros without treating fixed hard macros as occupied obstacles.
+
+   Fix: fixed hard macros are now inserted into the placed set before packing movable macros.
+
+## Full Simulation Result
+
+Command:
+
+```powershell
+$env:UV_CACHE_DIR='D:\workspace\partcl-macro-place-challenge\.uv-cache'
+uv run python team_trash_Workspace/sa_gpu/parallel_runner.py --all --seeds 1 2 3 4 --candidate-batch 16 --iters 80 --devices cuda:0 --out team_trash_Workspace/sa_gpu/results/full_cuda_after_legalize.jsonl
+```
+
+Summary:
+
+```text
+average proxy cost = 1.5347
+valid benchmarks   = 17 / 17
+overlap count      = 0 on every benchmark
+total runtime      = 1608 s
+average runtime    = 94.6 s / benchmark
+```
+
+Per-benchmark results:
+
+| Benchmark | Proxy | Wirelength | Density | Congestion | Overlaps | Runtime |
+|-----------|------:|-----------:|--------:|-----------:|---------:|--------:|
+| ibm01 | 1.2935 | 0.0916 | 0.9177 | 1.4862 | 0 | 23.84s |
+| ibm02 | 1.6383 | 0.0809 | 0.7925 | 2.3223 | 0 | 22.36s |
+| ibm03 | 1.4498 | 0.0866 | 0.8272 | 1.8993 | 0 | 20.45s |
+| ibm04 | 1.4670 | 0.0771 | 0.8652 | 1.9147 | 0 | 20.68s |
+| ibm06 | 1.8138 | 0.0672 | 0.8547 | 2.6384 | 0 | 23.77s |
+| ibm07 | 1.5154 | 0.0681 | 0.8510 | 2.0436 | 0 | 32.32s |
+| ibm08 | 1.5406 | 0.0722 | 0.8814 | 2.0553 | 0 | 41.69s |
+| ibm09 | 1.1460 | 0.0610 | 0.8659 | 1.3041 | 0 | 34.42s |
+| ibm10 | 1.4427 | 0.0715 | 0.7523 | 1.9900 | 0 | 143.60s |
+| ibm11 | 1.2704 | 0.0575 | 0.9033 | 1.5224 | 0 | 54.28s |
+| ibm12 | 1.7091 | 0.0626 | 0.8244 | 2.4686 | 0 | 137.22s |
+| ibm13 | 1.4531 | 0.0566 | 0.9277 | 1.8654 | 0 | 128.34s |
+| ibm14 | 1.6230 | 0.0540 | 0.9731 | 2.1650 | 0 | 189.79s |
+| ibm15 | 1.6114 | 0.0601 | 0.9415 | 2.1611 | 0 | 142.84s |
+| ibm16 | 1.5727 | 0.0518 | 0.8680 | 2.1739 | 0 | 187.24s |
+| ibm17 | 1.7510 | 0.0555 | 0.9508 | 2.4403 | 0 | 264.05s |
+| ibm18 | 1.7928 | 0.0542 | 1.0435 | 2.4336 | 0 | 141.06s |
+
+Leaderboard interpretation:
+
+- Beats the README SA baseline average by about 27.8%.
+- Beats RePlAce on 3 of 17 benchmarks: `ibm02`, `ibm10`, and `ibm12`.
+- Is about 5.3% worse than the RePlAce average.
+- Is about 5.4% worse than the README rank-8 public score and about 6.6% worse than rank 7.
+- Current level: valid and stronger than SA, but not yet at the current public leaderboard cutoff.
+
+Recommended next work:
+
+```text
+1. Add post-legalization local refinement that preserves zero overlap.
+2. Improve congestion approximation for official 3-pin and multi-pin behavior.
+3. Tune SA temperature and move distribution per benchmark size.
+4. Add candidate repair before evaluation, not only final legalization.
+5. Track official proxy on selected intermediate states for calibration against torch proxy.
+```

@@ -707,3 +707,148 @@ combined search_score
 ```
 
 这样框架后续接入 simulated annealing、local search 或 hybrid optimizer 时，不需要重新设计 cost path。
+
+## 实现状态：GPU Batched SA Placer
+
+日期：2026-04-14。
+
+第一版完整实现已放在 `team_trash_Workspace/sa_gpu` 下，没有修改主项目 package。
+
+已实现文件：
+
+```text
+sa_gpu/placer.py
+sa_gpu/benchmark_context.py
+sa_gpu/torch_objective.py
+sa_gpu/sa_optimizer.py
+sa_gpu/legalize.py
+sa_gpu/parallel_runner.py
+sa_gpu/tests/test_sa_gpu_smoke.py
+sa_gpu/README.md
+sa_gpu/README_zh.md
+```
+
+实现遵循原设计：
+
+```text
+official_proxy = wirelength + 0.5 * density + 0.5 * congestion
+search_score   = official_proxy + legality_penalty
+```
+
+已实现的主要能力：
+
+- 单次 optimizer 内部做多 seed state batch。
+- 每个 seed 每轮生成 batched candidates。
+- 使用 torch GPU 计算 wirelength、overlap、density、congestion proxy。
+- CUDA 不可用时自动 fallback 到 CPU。
+- 自定义 benchmark 级 parallel runner，支持 device 轮转分配。
+- 最终报告分数仍通过官方 `compute_proxy_cost`。
+
+关键实现细节：
+
+- `SAGPUPlacer` 必须直接定义在 `placer.py` 中，因为官方 loader 会检查 class module 是否等于文件 stem。
+- `benchmark_context.py` 重新加载 `PlacementCost`，提取 net、pin、port、grid、routing 数据。wirelength 归一化使用 `plc.net_cnt`。
+- macro pin 坐标通过 `parent_macro_xy + pin_offset` 重新计算，避免使用 stale pin position。
+- congestion 明确只是搜索 proxy。第一版对 routing pair 使用 source-to-sink L routing，不逐项复刻官方所有 3-pin branch 行为。
+
+## 实现和仿真中遇到的问题
+
+实现和全量仿真中发现了以下问题：
+
+1. `uv run` 会在手动安装 CUDA wheel 后重新同步回 CPU torch。
+
+   原因：`uv.lock` 仍然解析到 CPU torch。只手动安装 wheel 不够，因为 `uv run` 会按 lockfile 同步环境。
+
+   修复：使用 PyTorch CUDA wheel index 重新生成 `uv.lock`。当前验证环境：
+
+   ```text
+   torch = 2.11.0+cu128
+   torch.version.cuda = 12.8
+   torch.cuda.is_available() = True
+   GPU = NVIDIA GeForce RTX 4060 Laptop GPU
+   ```
+
+2. CPU 全量仿真过慢。
+
+   早期 `--all` CPU run 在完成前被停止。后续完整验证改为 CUDA。
+
+3. dense congestion tensor 显存风险过高。
+
+   第一版 CUDA congestion 会展开 `[batch, routing_pair, row, col]` 的 dense tensor，后面的大 IBM case 上显存风险较高。
+
+   修复：routing demand 改为每 512 条 routing pair 分块累加。每个 chunk 内仍保持 GPU 向量化，但降低峰值显存。
+
+4. runner 对长任务输出不够稳健。
+
+   旧版 runner 只在所有 benchmark 结束后写 JSONL。如果后面的 benchmark 失败，前面已经完成的结果也会丢失。
+
+   修复：每完成一个 benchmark 就增量写 JSONL，并把单个 benchmark 的 error 记录下来，而不是让整次运行静默失败。
+
+5. torch legality 与官方 overlap metrics 不完全一致。
+
+   早期结果中出现过 `validate_placement == True` 但官方 `compute_proxy_cost` 的 overlap count 非零的情况。现在最终返回前一定再做一次 legalization。
+
+6. shelf-packing fallback 没有避让 fixed macros。
+
+   最初 fallback legalizer 只排列 movable macros，没有把 fixed hard macros 当作已占用障碍。
+
+   修复：fixed hard macros 会先加入 placed set，然后再 pack movable macros。
+
+## 全量仿真结果
+
+命令：
+
+```powershell
+$env:UV_CACHE_DIR='D:\workspace\partcl-macro-place-challenge\.uv-cache'
+uv run python team_trash_Workspace/sa_gpu/parallel_runner.py --all --seeds 1 2 3 4 --candidate-batch 16 --iters 80 --devices cuda:0 --out team_trash_Workspace/sa_gpu/results/full_cuda_after_legalize.jsonl
+```
+
+汇总：
+
+```text
+average proxy cost = 1.5347
+valid benchmarks   = 17 / 17
+overlap count      = 每个 benchmark 都是 0
+total runtime      = 1608 s
+average runtime    = 94.6 s / benchmark
+```
+
+逐 benchmark 结果：
+
+| Benchmark | Proxy | Wirelength | Density | Congestion | Overlaps | Runtime |
+|-----------|------:|-----------:|--------:|-----------:|---------:|--------:|
+| ibm01 | 1.2935 | 0.0916 | 0.9177 | 1.4862 | 0 | 23.84s |
+| ibm02 | 1.6383 | 0.0809 | 0.7925 | 2.3223 | 0 | 22.36s |
+| ibm03 | 1.4498 | 0.0866 | 0.8272 | 1.8993 | 0 | 20.45s |
+| ibm04 | 1.4670 | 0.0771 | 0.8652 | 1.9147 | 0 | 20.68s |
+| ibm06 | 1.8138 | 0.0672 | 0.8547 | 2.6384 | 0 | 23.77s |
+| ibm07 | 1.5154 | 0.0681 | 0.8510 | 2.0436 | 0 | 32.32s |
+| ibm08 | 1.5406 | 0.0722 | 0.8814 | 2.0553 | 0 | 41.69s |
+| ibm09 | 1.1460 | 0.0610 | 0.8659 | 1.3041 | 0 | 34.42s |
+| ibm10 | 1.4427 | 0.0715 | 0.7523 | 1.9900 | 0 | 143.60s |
+| ibm11 | 1.2704 | 0.0575 | 0.9033 | 1.5224 | 0 | 54.28s |
+| ibm12 | 1.7091 | 0.0626 | 0.8244 | 2.4686 | 0 | 137.22s |
+| ibm13 | 1.4531 | 0.0566 | 0.9277 | 1.8654 | 0 | 128.34s |
+| ibm14 | 1.6230 | 0.0540 | 0.9731 | 2.1650 | 0 | 189.79s |
+| ibm15 | 1.6114 | 0.0601 | 0.9415 | 2.1611 | 0 | 142.84s |
+| ibm16 | 1.5727 | 0.0518 | 0.8680 | 2.1739 | 0 | 187.24s |
+| ibm17 | 1.7510 | 0.0555 | 0.9508 | 2.4403 | 0 | 264.05s |
+| ibm18 | 1.7928 | 0.0542 | 1.0435 | 2.4336 | 0 | 141.06s |
+
+按 leaderboard 口径解读：
+
+- 平均分比 README 中的 SA baseline 好约 27.8%。
+- 17 个 benchmark 中有 3 个赢过 RePlAce baseline：`ibm02`、`ibm10`、`ibm12`。
+- 平均分仍比 RePlAce average 差约 5.3%。
+- 比 README 当前第 8 名公开分数差约 5.4%，比第 7 名差约 6.6%。
+- 当前状态：合法性和 zero-overlap 已稳定，强于 SA baseline，但还没达到公开 leaderboard cutoff。
+
+建议下一步工作：
+
+```text
+1. 加入 post-legalization local refinement，在保持 zero overlap 的同时优化 proxy。
+2. 改进 congestion approximation，更贴近官方 3-pin 和 multi-pin routing 行为。
+3. 按 benchmark 规模调整 SA temperature 和 move distribution。
+4. 在 candidate evaluation 前加入 repair，而不是只在最终输出前 legalization。
+5. 对 selected intermediate states 计算官方 proxy，用来校准 torch proxy。
+```

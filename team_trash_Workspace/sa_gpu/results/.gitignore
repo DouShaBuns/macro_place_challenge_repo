@@ -1,0 +1,4 @@
+*.log
+*.err.log
+latest.jsonl
+check_*.jsonl
