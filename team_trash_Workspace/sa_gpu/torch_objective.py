@@ -134,10 +134,12 @@ class TorchProxyCostEvaluator:
         oy = (torch.minimum(top.unsqueeze(2), top.unsqueeze(1)) - torch.maximum(bottom.unsqueeze(2), bottom.unsqueeze(1))).clamp_min(0)
         area = ox * oy
         tri = torch.triu(torch.ones((n, n), dtype=torch.bool, device=self.device), diagonal=1)
+        pair_overlap = (ox[:, tri] > 0) & (oy[:, tri] > 0)
         pair_area = area[:, tri]
-        count = (pair_area > self.gap).sum(dim=1)
-        total = pair_area.sum(dim=1)
-        max_area = pair_area.max(dim=1).values if pair_area.shape[1] else torch.zeros(batch, device=self.device)
+        overlap_area = torch.where(pair_overlap, pair_area, torch.zeros_like(pair_area))
+        count = pair_overlap.sum(dim=1)
+        total = overlap_area.sum(dim=1)
+        max_area = overlap_area.max(dim=1).values if overlap_area.shape[1] else torch.zeros(batch, device=self.device)
         return count, total, max_area
 
     def _boundary_violation(self, placements):

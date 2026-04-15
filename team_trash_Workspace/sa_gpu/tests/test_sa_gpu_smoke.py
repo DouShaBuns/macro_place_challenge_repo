@@ -49,6 +49,26 @@ def test_overlap_and_legalize(ibm01):
     assert compute_overlap_metrics(legal, ibm01)["overlap_count"] == 0
 
 
+def test_torch_overlap_matches_official_strict_positive_overlap(ibm01):
+    if ibm01.num_hard_macros < 2:
+        pytest.skip("needs at least two hard macros")
+    placement = legalize_initial(ibm01)
+    sizes = ibm01.macro_sizes
+    i, j = 0, 1
+    thin_overlap = 1.0e-6
+    placement[j, 0] = placement[i, 0] + (sizes[i, 0] + sizes[j, 0]) / 2 - thin_overlap
+    placement[j, 1] = placement[i, 1]
+
+    official = compute_overlap_metrics(placement, ibm01)
+    ctx = build_benchmark_context(ibm01, "cpu")
+    evaluator = TorchProxyCostEvaluator(ctx)
+    costs = evaluator.evaluate_batch(placement)
+
+    assert official["overlap_count"] > 0
+    assert int(costs.overlap_count.item()) > 0
+    assert not bool(costs.is_legal.item())
+
+
 def test_official_loader_can_find_placer_class():
     placer_path = SA_GPU / "placer.py"
     spec = importlib.util.spec_from_file_location(placer_path.stem, str(placer_path))
