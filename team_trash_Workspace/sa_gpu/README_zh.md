@@ -28,6 +28,23 @@ $env:SA_GPU_ITERS='120'
 $env:SA_GPU_CANDIDATE_BATCH='32'
 $env:SA_GPU_SEEDS='42,43,44,45,46,47'
 $env:SA_GPU_DEVICE='cuda'
+$env:SA_GPU_WARM_START_PATH='team_trash_Workspace/sa_gpu/results/ibm01_placement.pt'
+```
+
+## Warm-start 接口
+
+SA 默认仍从 benchmark 自带的 `initial.plc` 合法化后启动。为了后续接入 RePlAce 或其他初始解生成器，`SAGPUPlacer` 现在支持 warm-start provider：
+
+```python
+placer = SAGPUPlacer(warm_start=my_method)
+```
+
+`my_method` 可以是 callable，也可以实现 `generate(benchmark)` 或 `place(benchmark)`，返回 `[num_macros, 2]` 的完整 placement，或只返回 `[num_hard_macros, 2]` 的 hard macro placement。SA 会在开始退火前统一补齐 soft macro、恢复 fixed macro、legalize 和 clamp。
+
+也可以直接从 torch 保存的 placement 启动：
+
+```powershell
+uv run python team_trash_Workspace/sa_gpu/parallel_runner.py --benchmarks ibm01 --warm-start-path path\to\placement.pt
 ```
 
 ## Cost Model

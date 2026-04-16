@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from benchmark_context import BenchmarkContext
 
@@ -30,6 +29,7 @@ class TorchProxyCostEvaluator:
         overlap_weight: float = 1000.0,
         boundary_weight: float = 1000.0,
         gap: float = 1.0e-4,
+        congestion_mode: str = "exact",
     ):
         self.ctx = context
         self.benchmark = context.benchmark
@@ -37,6 +37,9 @@ class TorchProxyCostEvaluator:
         self.overlap_weight = float(overlap_weight)
         self.boundary_weight = float(boundary_weight)
         self.gap = float(gap)
+        self.congestion_mode = congestion_mode.lower()
+        if self.congestion_mode not in {"exact", "fast", "none"}:
+            raise ValueError(f"Unsupported congestion_mode: {congestion_mode}")
         self.sizes = self.benchmark.macro_sizes.to(self.device, dtype=torch.float32)
         self.fixed_mask = self.benchmark.macro_fixed.to(self.device)
         self.original_positions = self.benchmark.macro_positions.to(self.device, dtype=torch.float32)
@@ -49,6 +52,7 @@ class TorchProxyCostEvaluator:
         self.grid_h = self.canvas_h / max(self.grid_rows, 1)
         self.grid_area = self.grid_w * self.grid_h
         self.grid_boxes = self._make_grid_boxes()
+        self.net_pin_ranges = self._make_net_pin_ranges()
 
     def evaluate_batch(self, placements: torch.Tensor) -> CostBreakdown:
         if placements.dim() == 2:
@@ -134,10 +138,12 @@ class TorchProxyCostEvaluator:
         oy = (torch.minimum(top.unsqueeze(2), top.unsqueeze(1)) - torch.maximum(bottom.unsqueeze(2), bottom.unsqueeze(1))).clamp_min(0)
         area = ox * oy
         tri = torch.triu(torch.ones((n, n), dtype=torch.bool, device=self.device), diagonal=1)
+        pair_overlap = (ox[:, tri] > 0) & (oy[:, tri] > 0)
         pair_area = area[:, tri]
-        count = (pair_area > self.gap).sum(dim=1)
-        total = pair_area.sum(dim=1)
-        max_area = pair_area.max(dim=1).values if pair_area.shape[1] else torch.zeros(batch, device=self.device)
+        overlap_area = torch.where(pair_overlap, pair_area, torch.zeros_like(pair_area))
+        count = pair_overlap.sum(dim=1)
+        total = overlap_area.sum(dim=1)
+        max_area = overlap_area.max(dim=1).values if overlap_area.shape[1] else torch.zeros(batch, device=self.device)
         return count, total, max_area
 
     def _boundary_violation(self, placements):
@@ -177,12 +183,51 @@ class TorchProxyCostEvaluator:
         return 0.5 * torch.topk(density, k=k, dim=1).values.mean(dim=1)
 
     def _congestion(self, placements):
+        if self.congestion_mode == "fast":
+            return self._congestion_fast(placements)
+        if self.congestion_mode == "none":
+            return torch.zeros(placements.shape[0], dtype=torch.float32, device=self.device)
+
+        ctx = self.ctx
+        batch = placements.shape[0]
+        grid_count = self.grid_rows * self.grid_cols
+        if grid_count == 0 or not self.net_pin_ranges:
+            return torch.zeros(batch, dtype=torch.float32, device=self.device)
+        h = torch.zeros((batch, self.grid_rows, self.grid_cols), dtype=torch.float32, device=self.device)
+        v = torch.zeros_like(h)
+        pin_pos = self._pin_positions(
+            placements,
+            ctx.net_pin_parent,
+            ctx.net_pin_offset,
+            ctx.net_pin_port_pos,
+            ctx.net_pin_is_port,
+        )
+        pin_col, pin_row = self._grid_location(pin_pos)
+
+        for start, end, weight in self.net_pin_ranges:
+            source = torch.stack((pin_row[:, start], pin_col[:, start]), dim=1)
+            net_nodes = torch.stack((pin_row[:, start:end], pin_col[:, start:end]), dim=2)
+            self._route_official_net(h, v, source, net_nodes, weight)
+
+        grid_v_routes = max(self.grid_w * float(self.benchmark.vroutes_per_micron), 1.0e-9)
+        grid_h_routes = max(self.grid_h * float(self.benchmark.hroutes_per_micron), 1.0e-9)
+        h = self._smooth_h(h / grid_h_routes)
+        v = self._smooth_v(v / grid_v_routes)
+        v_macro, h_macro = self._macro_blockage(placements, grid_v_routes, grid_h_routes)
+        combined = torch.cat([(v + v_macro).reshape(batch, -1), (h + h_macro).reshape(batch, -1)], dim=1)
+        k = int(combined.shape[1] * 0.05)
+        if k <= 0:
+            return combined.max(dim=1).values
+        return torch.topk(combined, k=k, dim=1).values.mean(dim=1)
+
+    def _congestion_fast(self, placements):
         ctx = self.ctx
         batch = placements.shape[0]
         grid_count = self.grid_rows * self.grid_cols
         pair_count = ctx.routing_weights.numel()
         if grid_count == 0 or pair_count == 0:
             return torch.zeros(batch, dtype=torch.float32, device=self.device)
+
         src = self._pin_positions(
             placements,
             ctx.routing_src_parent,
@@ -200,29 +245,39 @@ class TorchProxyCostEvaluator:
         src_col, src_row = self._grid_location(src)
         dst_col, dst_row = self._grid_location(dst)
 
-        cols = torch.arange(self.grid_cols, device=self.device).view(1, 1, self.grid_cols)
-        rows = torch.arange(self.grid_rows, device=self.device).view(1, 1, self.grid_rows)
-        h = torch.zeros((batch, self.grid_rows, self.grid_cols), dtype=torch.float32, device=self.device)
-        v = torch.zeros_like(h)
-        chunk_size = 512
-        for start in range(0, pair_count, chunk_size):
-            end = min(start + chunk_size, pair_count)
-            src_col_c = src_col[:, start:end]
-            dst_col_c = dst_col[:, start:end]
-            src_row_c = src_row[:, start:end]
-            dst_row_c = dst_row[:, start:end]
-            col_min = torch.minimum(src_col_c, dst_col_c).unsqueeze(-1)
-            col_max = torch.maximum(src_col_c, dst_col_c).unsqueeze(-1)
-            row_min = torch.minimum(src_row_c, dst_row_c).unsqueeze(-1)
-            row_max = torch.maximum(src_row_c, dst_row_c).unsqueeze(-1)
-            h_cols = (cols >= col_min) & (cols < col_max)
-            v_rows = (rows >= row_min) & (rows < row_max)
+        h_diff = torch.zeros(
+            (batch, self.grid_rows, self.grid_cols + 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        v_diff = torch.zeros(
+            (batch, self.grid_rows + 1, self.grid_cols),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        batch_ids = torch.arange(batch, device=self.device).view(-1, 1).expand(batch, pair_count)
+        weights = ctx.routing_weights.view(1, -1).expand(batch, pair_count)
 
-            weights = ctx.routing_weights[start:end].view(1, end - start, 1, 1)
-            h_row_onehot = F.one_hot(src_row_c, num_classes=self.grid_rows).to(torch.float32)
-            v_col_onehot = F.one_hot(dst_col_c, num_classes=self.grid_cols).to(torch.float32)
-            h += (h_row_onehot.unsqueeze(-1) * h_cols.unsqueeze(2).to(torch.float32) * weights).sum(dim=1)
-            v += (v_rows.unsqueeze(-1).to(torch.float32) * v_col_onehot.unsqueeze(2) * weights).sum(dim=1)
+        col_min = torch.minimum(src_col, dst_col)
+        col_max = torch.maximum(src_col, dst_col)
+        h_mask = col_max > col_min
+        if bool(h_mask.any()):
+            h_base = batch_ids * (self.grid_rows * (self.grid_cols + 1)) + src_row * (self.grid_cols + 1)
+            h_flat = h_diff.reshape(-1)
+            h_flat.scatter_add_(0, (h_base + col_min)[h_mask], weights[h_mask])
+            h_flat.scatter_add_(0, (h_base + col_max)[h_mask], -weights[h_mask])
+
+        row_min = torch.minimum(src_row, dst_row)
+        row_max = torch.maximum(src_row, dst_row)
+        v_mask = row_max > row_min
+        if bool(v_mask.any()):
+            v_base = batch_ids * ((self.grid_rows + 1) * self.grid_cols) + dst_col
+            v_flat = v_diff.reshape(-1)
+            v_flat.scatter_add_(0, (v_base + row_min * self.grid_cols)[v_mask], weights[v_mask])
+            v_flat.scatter_add_(0, (v_base + row_max * self.grid_cols)[v_mask], -weights[v_mask])
+
+        h = h_diff.cumsum(dim=2)[:, :, : self.grid_cols]
+        v = v_diff.cumsum(dim=1)[:, : self.grid_rows, :]
 
         grid_v_routes = max(self.grid_w * float(self.benchmark.vroutes_per_micron), 1.0e-9)
         grid_h_routes = max(self.grid_h * float(self.benchmark.hroutes_per_micron), 1.0e-9)
@@ -234,6 +289,85 @@ class TorchProxyCostEvaluator:
         if k <= 0:
             return combined.max(dim=1).values
         return torch.topk(combined, k=k, dim=1).values.mean(dim=1)
+
+    def _route_official_net(self, h, v, source, net_nodes, weight: float) -> None:
+        for batch_idx in range(net_nodes.shape[0]):
+            source_gcell = (int(source[batch_idx, 0].item()), int(source[batch_idx, 1].item()))
+            node_gcells = {
+                (int(row.item()), int(col.item()))
+                for row, col in net_nodes[batch_idx]
+            }
+            node_gcells.add(source_gcell)
+            if len(node_gcells) == 2:
+                self._route_two_pin(h, v, batch_idx, source_gcell, node_gcells, weight)
+            elif len(node_gcells) == 3:
+                self._route_three_pin(h, v, batch_idx, node_gcells, weight)
+            elif len(node_gcells) > 3:
+                for sink_gcell in node_gcells:
+                    if sink_gcell != source_gcell:
+                        self._route_two_pin(h, v, batch_idx, source_gcell, {source_gcell, sink_gcell}, weight)
+
+    def _route_two_pin(self, h, v, batch_idx: int, source_gcell, node_gcells, weight: float) -> None:
+        nodes = list(node_gcells)
+        sink_gcell = nodes[1] if nodes[0] == source_gcell else nodes[0]
+        row_min = min(sink_gcell[0], source_gcell[0])
+        row_max = max(sink_gcell[0], source_gcell[0])
+        col_min = min(sink_gcell[1], source_gcell[1])
+        col_max = max(sink_gcell[1], source_gcell[1])
+        if col_max > col_min:
+            h[batch_idx, source_gcell[0], col_min:col_max] += weight
+        if row_max > row_min:
+            v[batch_idx, row_min:row_max, sink_gcell[1]] += weight
+
+    def _route_three_pin(self, h, v, batch_idx: int, node_gcells, weight: float) -> None:
+        nodes = sorted(node_gcells, key=lambda x: (x[1], x[0]))
+        y1, x1 = nodes[0]
+        y2, x2 = nodes[1]
+        y3, x3 = nodes[2]
+        if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
+            self._route_l(h, v, batch_idx, nodes, weight)
+        elif x2 == x3 and x1 < x2 and y1 < min(y2, y3):
+            if x2 > x1:
+                h[batch_idx, y1, x1:x2] += weight
+            if max(y2, y3) > y1:
+                v[batch_idx, y1:max(y2, y3), x2] += weight
+        elif y2 == y3:
+            if x2 > x1:
+                h[batch_idx, y1, x1:x2] += weight
+            if x3 > x2:
+                h[batch_idx, y2, x2:x3] += weight
+            if max(y2, y1) > min(y2, y1):
+                v[batch_idx, min(y2, y1):max(y2, y1), x2] += weight
+        else:
+            self._route_t(h, v, batch_idx, node_gcells, weight)
+
+    def _route_l(self, h, v, batch_idx: int, nodes, weight: float) -> None:
+        nodes = sorted(nodes, key=lambda x: (x[1], x[0]))
+        y1, x1 = nodes[0]
+        y2, x2 = nodes[1]
+        y3, x3 = nodes[2]
+        if x2 > x1:
+            h[batch_idx, y1, x1:x2] += weight
+        if x3 > x2:
+            h[batch_idx, y2, x2:x3] += weight
+        if max(y1, y2) > min(y1, y2):
+            v[batch_idx, min(y1, y2):max(y1, y2), x2] += weight
+        if max(y2, y3) > min(y2, y3):
+            v[batch_idx, min(y2, y3):max(y2, y3), x3] += weight
+
+    def _route_t(self, h, v, batch_idx: int, node_gcells, weight: float) -> None:
+        nodes = sorted(node_gcells)
+        y1, x1 = nodes[0]
+        y2, x2 = nodes[1]
+        y3, x3 = nodes[2]
+        xmin = min(x1, x2, x3)
+        xmax = max(x1, x2, x3)
+        if xmax > xmin:
+            h[batch_idx, y2, xmin:xmax] += weight
+        if max(y1, y2) > min(y1, y2):
+            v[batch_idx, min(y1, y2):max(y1, y2), x1] += weight
+        if max(y2, y3) > min(y2, y3):
+            v[batch_idx, min(y2, y3):max(y2, y3), x3] += weight
 
     def _macro_blockage(self, placements, grid_v_routes: float, grid_h_routes: float):
         batch = placements.shape[0]
@@ -250,8 +384,32 @@ class TorchProxyCostEvaluator:
             torch.minimum(macro_boxes[:, :, 3].unsqueeze(2), grid[:, 3].view(1, 1, -1))
             - torch.maximum(macro_boxes[:, :, 1].unsqueeze(2), grid[:, 1].view(1, 1, -1))
         ).clamp_min(0)
-        v = (x_overlap * float(self.ctx.vrouting_alloc)).sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_v_routes
-        h = (y_overlap * float(self.ctx.hrouting_alloc)).sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_h_routes
+        overlap_mask = (x_overlap > 0) & (y_overlap > 0)
+        x_overlap = torch.where(overlap_mask, x_overlap, torch.zeros_like(x_overlap))
+        y_overlap = torch.where(overlap_mask, y_overlap, torch.zeros_like(y_overlap))
+        v_contrib = x_overlap * float(self.ctx.vrouting_alloc)
+        h_contrib = y_overlap * float(self.ctx.hrouting_alloc)
+        if self.grid_rows > 0 and self.grid_cols > 0:
+            partial_v = (y_overlap > 0) & ((y_overlap - self.grid_h).abs() > 1.0e-5)
+            partial_h = (x_overlap > 0) & ((x_overlap - self.grid_w).abs() > 1.0e-5)
+            grid_rows = torch.arange(self.grid_rows, device=self.device).repeat_interleave(self.grid_cols)
+            grid_cols = torch.arange(self.grid_cols, device=self.device).repeat(self.grid_rows)
+            top_rows = torch.floor((macro_boxes[:, :, 3] / max(self.grid_h, 1.0e-9))).to(torch.long).clamp(0, self.grid_rows - 1)
+            right_cols = torch.floor((macro_boxes[:, :, 2] / max(self.grid_w, 1.0e-9))).to(torch.long).clamp(0, self.grid_cols - 1)
+            top_mask = grid_rows.view(1, 1, -1) == top_rows.unsqueeze(2)
+            right_mask = grid_cols.view(1, 1, -1) == right_cols.unsqueeze(2)
+            vertical_span = (
+                torch.floor((macro_boxes[:, :, 3] / max(self.grid_h, 1.0e-9))).to(torch.long)
+                != torch.floor((macro_boxes[:, :, 1] / max(self.grid_h, 1.0e-9))).to(torch.long)
+            ).unsqueeze(2)
+            horizontal_span = (
+                torch.floor((macro_boxes[:, :, 2] / max(self.grid_w, 1.0e-9))).to(torch.long)
+                != torch.floor((macro_boxes[:, :, 0] / max(self.grid_w, 1.0e-9))).to(torch.long)
+            ).unsqueeze(2)
+            v_contrib = torch.where(vertical_span & top_mask & partial_v, torch.zeros_like(v_contrib), v_contrib)
+            h_contrib = torch.where(horizontal_span & right_mask & partial_h, torch.zeros_like(h_contrib), h_contrib)
+        v = v_contrib.sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_v_routes
+        h = h_contrib.sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_h_routes
         return v, h
 
     def _smooth_v(self, v):
@@ -301,3 +459,18 @@ class TorchProxyCostEvaluator:
             for col in range(self.grid_cols):
                 boxes.append((col * self.grid_w, row * self.grid_h, (col + 1) * self.grid_w, (row + 1) * self.grid_h))
         return torch.tensor(boxes, dtype=torch.float32, device=self.device)
+
+    def _make_net_pin_ranges(self):
+        ids = self.ctx.net_pin_net_id.detach().cpu().tolist()
+        ranges = []
+        start = 0
+        while start < len(ids):
+            net_id = ids[start]
+            end = start + 1
+            while end < len(ids) and ids[end] == net_id:
+                end += 1
+            if end - start >= 2:
+                weight = float(self.ctx.net_weights[net_id].detach().cpu().item())
+                ranges.append((start, end, weight))
+            start = end
+        return ranges
