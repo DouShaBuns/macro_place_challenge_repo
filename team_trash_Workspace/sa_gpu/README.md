@@ -30,6 +30,29 @@ $env:SA_GPU_SEEDS='42,43,44,45,46,47'
 $env:SA_GPU_DEVICE='cuda'
 ```
 
+## Optimization Trace GIF
+
+Tracing is disabled by default. Enable it with environment variables before
+running the normal evaluator:
+
+```powershell
+$env:TRACE_PLACEMENT='1'
+$env:TRACE_EVERY='10'
+$env:TRACE_DIR='output/traces'
+$env:TRACE_FPS='8'
+uv run evaluate team_trash_Workspace/sa_gpu/placer.py -b ibm01
+```
+
+This writes:
+
+```text
+output/traces/sa_gpu/ibm01/sa_gpu_ibm01.gif
+```
+
+The GIF records the initial legalized placement, periodic best placements from
+the annealing loop, and the final legalized placement. Set
+`TRACE_KEEP_FRAMES=1` to keep the intermediate PNG frames.
+
 ## Cost Model
 
 The search proxy uses torch batched computations:

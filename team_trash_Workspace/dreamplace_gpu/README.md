@@ -33,6 +33,31 @@ $env:DP_SEEDS='42,43,44,45'
 $env:DP_LOCAL_REFINE_TRIALS='220'
 ```
 
+## Optimization Trace GIF
+
+Tracing is disabled by default. Enable it with environment variables before
+running the normal evaluator. For a pure analytical trace:
+
+```powershell
+$env:DP_RUN_REFINE='0'
+$env:TRACE_PLACEMENT='1'
+$env:TRACE_EVERY='10'
+$env:TRACE_DIR='output/traces'
+$env:TRACE_FPS='8'
+uv run evaluate team_trash_Workspace/dreamplace_gpu/placer.py -b ibm01
+```
+
+This writes:
+
+```text
+output/traces/dreamplace_gpu/ibm01/dreamplace_gpu_ibm01.gif
+```
+
+The GIF records the initial legalized placement, periodic frames from each
+analytical recipe, each recipe best placement, the best legalized candidate,
+and the final placement. Set `TRACE_KEEP_FRAMES=1` to keep the intermediate PNG
+frames.
+
 ## Pure Analytical Full IBM Run 2026-04-16
 
 This run disables the SA-style refinement stage and records the current

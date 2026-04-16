@@ -7,6 +7,7 @@ import torch
 
 from benchmark_context import build_benchmark_context
 from legalize import clamp_placement, legalize_initial, legalize_placement
+from trace_utils import PlacementTraceRecorder
 from torch_objective import TorchProxyCostEvaluator
 
 
@@ -29,6 +30,7 @@ class SAOptimizer:
         self.device = torch.device(device)
 
     def optimize(self, benchmark) -> torch.Tensor:
+        trace = PlacementTraceRecorder.from_env("sa_gpu", benchmark)
         ctx = build_benchmark_context(benchmark, self.device)
         evaluator = TorchProxyCostEvaluator(
             ctx,
@@ -47,6 +49,8 @@ class SAOptimizer:
             current.official_proxy,
             torch.full_like(current.official_proxy, torch.inf),
         )
+        if trace is not None:
+            trace.record(init, "initial")
 
         for step in range(max(int(self.config.iters), 0)):
             temp = self._temperature(step)
@@ -84,6 +88,8 @@ class SAOptimizer:
             if bool(state_legal_better.any()):
                 best_pos = torch.where(state_legal_better.view(-1, 1, 1), state, best_pos)
                 best_cost = torch.where(state_legal_better, current.official_proxy, best_cost)
+            if trace is not None and trace.should_record_step(step):
+                trace.record(self._best_trace_position(best_pos, best_cost, state), f"step_{step:04d}")
 
         if torch.isfinite(best_cost).any():
             best_seed = int(torch.argmin(best_cost).item())
@@ -91,7 +97,11 @@ class SAOptimizer:
         else:
             result = init.detach().cpu()
         result = legalize_placement(result, benchmark)
-        return clamp_placement(result, benchmark).cpu()
+        result = clamp_placement(result, benchmark).cpu()
+        if trace is not None:
+            trace.record(result, "final")
+            trace.close()
+        return result
 
     def _temperature(self, step: int) -> float:
         t_start = self.config.t_start_scale
@@ -153,3 +163,10 @@ class SAOptimizer:
         if bool(fixed.any()):
             orig = benchmark.macro_positions.to(self.device, dtype=placements.dtype)
             placements[:, fixed, :] = orig[fixed]
+
+    def _best_trace_position(
+        self, best_pos: torch.Tensor, best_cost: torch.Tensor, fallback: torch.Tensor
+    ) -> torch.Tensor:
+        if torch.isfinite(best_cost).any():
+            return best_pos[int(torch.argmin(best_cost).item())].detach().cpu()
+        return fallback[0].detach().cpu()

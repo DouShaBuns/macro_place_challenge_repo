@@ -13,6 +13,7 @@ if str(_SA_GPU) not in sys.path:
 
 from benchmark_context import build_benchmark_context, load_plc_for_benchmark  # noqa: E402
 from legalize import clamp_placement, legalize_initial, legalize_placement  # noqa: E402
+from trace_utils import PlacementTraceRecorder  # noqa: E402
 from torch_objective import TorchProxyCostEvaluator  # noqa: E402
 
 from macro_place.objective import compute_proxy_cost  # noqa: E402
@@ -45,9 +46,10 @@ class DreamPlaceHybridOptimizer:
         self.device = torch.device(device)
 
     def optimize(self, benchmark) -> torch.Tensor:
+        trace = PlacementTraceRecorder.from_env("dreamplace_gpu", benchmark)
         ctx = build_benchmark_context(benchmark, self.device)
         analytical = DreamPlaceAnalyticalOptimizer(self.config, self.device, ctx)
-        candidates = analytical.generate_candidates(benchmark)
+        candidates = analytical.generate_candidates(benchmark, trace=trace)
 
         legalized = [clamp_placement(legalize_placement(pos.cpu(), benchmark, gap=0.01), benchmark) for pos in candidates]
         legalized.append(legalize_placement(benchmark.macro_positions, benchmark, gap=0.01))
@@ -55,18 +57,28 @@ class DreamPlaceHybridOptimizer:
 
         ranked = self._rank_official(legalized, benchmark)
         starts = [pos for _, pos in ranked[: max(1, min(self.config.top_k_candidates, len(ranked)))]]
+        if trace is not None and starts:
+            trace.record(starts[0], "legalized_best")
         local = self._local_refine_best(starts, benchmark, ctx)
         if local:
             reranked = self._rank_official(starts + local, benchmark)
             starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
         if not self.config.run_refine or self.config.refine_iters <= 0:
-            return starts[0].cpu()
+            result = starts[0].cpu()
+            if trace is not None:
+                trace.record(result, "final")
+                trace.close()
+            return result
 
         refiner = AnalyticalSARefiner(self.config, self.device, ctx)
         refined = refiner.refine(benchmark, starts)
         all_final = starts + refined
         ranked_final = self._rank_official(all_final, benchmark)
-        return ranked_final[0][1].cpu()
+        result = ranked_final[0][1].cpu()
+        if trace is not None:
+            trace.record(result, "final")
+            trace.close()
+        return result
 
     def _local_refine_best(self, candidates: list[torch.Tensor], benchmark, ctx) -> list[torch.Tensor]:
         ranked = self._rank_official(candidates, benchmark)
@@ -157,23 +169,27 @@ class DreamPlaceAnalyticalOptimizer:
         self.device = device
         self.ctx = ctx
 
-    def generate_candidates(self, benchmark) -> list[torch.Tensor]:
+    def generate_candidates(self, benchmark, trace: PlacementTraceRecorder | None = None) -> list[torch.Tensor]:
         base = clamp_placement(legalize_initial(benchmark), benchmark).to(self.device, dtype=torch.float32)
         candidates = [base.detach().cpu()]
+        if trace is not None:
+            trace.record(base, "initial")
 
         recipes = (
             (0.12, 0.018, 0.030, 0.78),
             (0.18, 0.025, 0.035, 0.82),
             (0.28, 0.035, 0.030, 0.88),
         )
-        for density_weight, gamma_scale, lr_scale, target_density in recipes:
+        for recipe_idx, (density_weight, gamma_scale, lr_scale, target_density) in enumerate(recipes):
             pos = self._run_one(
                 benchmark,
                 base,
+                recipe_idx=recipe_idx,
                 density_weight=density_weight,
                 gamma_scale=gamma_scale,
                 lr_scale=lr_scale,
                 target_density=target_density,
+                trace=trace,
             )
             candidates.append(pos.detach().cpu())
         return candidates
@@ -182,10 +198,12 @@ class DreamPlaceAnalyticalOptimizer:
         self,
         benchmark,
         start: torch.Tensor,
+        recipe_idx: int,
         density_weight: float,
         gamma_scale: float,
         lr_scale: float,
         target_density: float,
+        trace: PlacementTraceRecorder | None = None,
     ) -> torch.Tensor:
         sizes = benchmark.macro_sizes.to(self.device, dtype=torch.float32)
         original = benchmark.macro_positions.to(self.device, dtype=torch.float32)
@@ -223,6 +241,10 @@ class DreamPlaceAnalyticalOptimizer:
                 if loss_value < best_loss:
                     best_loss = loss_value
                     best = x.detach().clone()
+                if trace is not None and trace.should_record_step(step):
+                    trace.record(x.detach(), f"recipe_{recipe_idx}_step_{step:04d}")
+        if trace is not None:
+            trace.record(best.detach(), f"recipe_{recipe_idx}_best")
         return best
 
     def _pin_positions(self, placement: torch.Tensor):
