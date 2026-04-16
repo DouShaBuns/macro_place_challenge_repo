@@ -119,6 +119,63 @@ Per-benchmark results:
 | ibm17 | 1.7510 | 0.0555 | 0.9508 | 2.4403 | 0 | 264.05s |
 | ibm18 | 1.7928 | 0.0542 | 1.0435 | 2.4336 | 0 | 141.06s |
 
+## Full IBM Rerun 2026-04-16
+
+Environment:
+
+```text
+torch = 2.11.0+cu128
+torch.version.cuda = 12.8
+torch.cuda.is_available() = True
+GPU = NVIDIA GeForce RTX 4060 Laptop GPU
+```
+
+Validation commands:
+
+```powershell
+uv run --extra dev pytest team_trash_Workspace/sa_gpu/tests
+uv run python team_trash_Workspace/sa_gpu/parallel_runner.py --all --seeds 1 2 3 4 --candidate-batch 16 --iters 80 --devices cuda:0 --out team_trash_Workspace/sa_gpu/results/full_cuda_rerun_20260416_142548.jsonl
+```
+
+Smoke tests passed:
+
+```text
+3 passed
+```
+
+Full IBM rerun result:
+
+```text
+result file       = team_trash_Workspace/sa_gpu/results/full_cuda_rerun_20260416_142548.jsonl
+average proxy     = 1.5332
+valid benchmarks  = 17 / 17
+overlap count     = 0 on every benchmark
+total runtime     = 2436.57 s
+average runtime   = 143.33 s / benchmark
+```
+
+Per-benchmark results:
+
+| Benchmark | Proxy | Wirelength | Density | Congestion | Overlaps | Runtime |
+|-----------|------:|-----------:|--------:|-----------:|---------:|--------:|
+| ibm01 | 1.2608 | 0.0891 | 0.9176 | 1.4259 | 0 | 27.83s |
+| ibm02 | 1.6383 | 0.0809 | 0.7925 | 2.3223 | 0 | 25.92s |
+| ibm03 | 1.4498 | 0.0866 | 0.8272 | 1.8993 | 0 | 24.81s |
+| ibm04 | 1.4670 | 0.0771 | 0.8652 | 1.9147 | 0 | 26.81s |
+| ibm06 | 1.8138 | 0.0672 | 0.8547 | 2.6384 | 0 | 31.37s |
+| ibm07 | 1.5154 | 0.0681 | 0.8510 | 2.0436 | 0 | 43.33s |
+| ibm08 | 1.5406 | 0.0722 | 0.8814 | 2.0553 | 0 | 56.35s |
+| ibm09 | 1.1453 | 0.0608 | 0.8654 | 1.3037 | 0 | 46.52s |
+| ibm10 | 1.4427 | 0.0715 | 0.7523 | 1.9900 | 0 | 254.71s |
+| ibm11 | 1.2704 | 0.0575 | 0.9033 | 1.5224 | 0 | 79.77s |
+| ibm12 | 1.7083 | 0.0625 | 0.8247 | 2.4669 | 0 | 510.47s |
+| ibm13 | 1.4615 | 0.0568 | 0.9280 | 1.8815 | 0 | 344.24s |
+| ibm14 | 1.6230 | 0.0540 | 0.9731 | 2.1650 | 0 | 379.55s |
+| ibm15 | 1.6112 | 0.0601 | 0.9400 | 2.1621 | 0 | 114.65s |
+| ibm16 | 1.5727 | 0.0518 | 0.8680 | 2.1739 | 0 | 150.11s |
+| ibm17 | 1.7506 | 0.0554 | 0.9505 | 2.4398 | 0 | 207.72s |
+| ibm18 | 1.7928 | 0.0542 | 1.0435 | 2.4336 | 0 | 112.41s |
+
 Leaderboard interpretation from the repository README:
 
 - The score beats the SA baseline average by about 27.8%.
