@@ -28,6 +28,23 @@ $env:SA_GPU_ITERS='120'
 $env:SA_GPU_CANDIDATE_BATCH='32'
 $env:SA_GPU_SEEDS='42,43,44,45,46,47'
 $env:SA_GPU_DEVICE='cuda'
+$env:SA_GPU_WARM_START_PATH='team_trash_Workspace/sa_gpu/results/ibm01_placement.pt'
+```
+
+## Warm-start Interface
+
+By default SA still starts from the legalized benchmark `initial.plc`. To make room for RePlAce or other initial-solution generators, `SAGPUPlacer` now accepts a warm-start provider:
+
+```python
+placer = SAGPUPlacer(warm_start=my_method)
+```
+
+`my_method` may be callable or implement `generate(benchmark)` / `place(benchmark)`. It may return a full `[num_macros, 2]` placement or a hard-macro-only `[num_hard_macros, 2]` placement. SA fills soft macros from the benchmark, restores fixed macros, legalizes, and clamps before annealing starts.
+
+You can also start from a torch-saved placement:
+
+```powershell
+uv run python team_trash_Workspace/sa_gpu/parallel_runner.py --benchmarks ibm01 --warm-start-path path\to\placement.pt
 ```
 
 ## Cost Model

@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=80)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--devices", nargs="*", default=None, help="Devices, e.g. cuda:0 cuda:1 or cpu.")
+    parser.add_argument("--warm-start-path", default=None, help="Optional torch-saved placement used as the SA start.")
     parser.add_argument("--out", default="team_trash_Workspace/sa_gpu/results/latest.jsonl")
     args = parser.parse_args()
     if args.benchmarks:
@@ -58,6 +59,7 @@ def main() -> None:
             "candidate_batch": args.candidate_batch,
             "iters": args.iters,
             "device": devices[idx % len(devices)],
+            "warm_start_path": args.warm_start_path,
         }
         for idx, name in enumerate(benchmarks)
     ]
@@ -124,6 +126,7 @@ def _error_result(job: dict, error: str) -> dict:
         "seeds": list(job["seeds"]),
         "iters": int(job["iters"]),
         "candidate_batch": int(job["candidate_batch"]),
+        "warm_start_path": job.get("warm_start_path"),
     }
 
 
@@ -134,6 +137,7 @@ def _run_one(job: dict) -> dict:
         iters=int(job["iters"]),
         candidate_batch=int(job["candidate_batch"]),
         device=str(job["device"]),
+        warm_start_path=job.get("warm_start_path"),
     )
     start = time.time()
     placement = placer.place(benchmark)
@@ -154,6 +158,7 @@ def _run_one(job: dict) -> dict:
         "seeds": list(job["seeds"]),
         "iters": int(job["iters"]),
         "candidate_batch": int(job["candidate_batch"]),
+        "warm_start_path": job.get("warm_start_path"),
     }
 
 
