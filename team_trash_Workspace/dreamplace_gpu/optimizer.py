@@ -26,6 +26,13 @@ class DreamPlaceConfig:
     refine_candidate_batch: int = 16
     seeds: tuple[int, ...] = (42, 43, 44, 45)
     density_weight: float = 0.18
+    congestion_weight: float = 0.05
+    congestion_target: float = 0.85
+    congestion_density_alpha: float = 0.15
+    congestion_map_update_interval: int = 20
+    soft_route_congestion_weight: float = 0.02
+    soft_route_tau_scale: float = 0.5
+    soft_route_chunk_size: int = 512
     overlap_weight: float = 18.0
     boundary_weight: float = 25.0
     target_density: float = 0.82
@@ -33,9 +40,14 @@ class DreamPlaceConfig:
     learning_rate: float = 0.035
     bin_grid_cap: int = 48
     optimize_soft_macros: bool = True
-    run_refine: bool = True
+    run_refine: bool = False
     top_k_candidates: int = 8
-    local_refine_trials: int = 220
+    local_refine_trials: int = 0
+    recipes: tuple[tuple[float, float, float, float], ...] = (
+        (0.12, 0.018, 0.030, 0.78),
+        (0.18, 0.025, 0.035, 0.82),
+        (0.28, 0.035, 0.030, 0.88),
+    )
 
 
 class DreamPlaceHybridOptimizer:
@@ -59,7 +71,9 @@ class DreamPlaceHybridOptimizer:
         starts = [pos for _, pos in ranked[: max(1, min(self.config.top_k_candidates, len(ranked)))]]
         if trace is not None and starts:
             trace.record(starts[0], "legalized_best")
-        local = self._local_refine_best(starts, benchmark, ctx)
+        if starts:
+            self._log_proxy_calibration(starts[0], benchmark, ctx)
+        local = self._local_refine_best(starts, benchmark, ctx) if self.config.local_refine_trials > 0 else []
         if local:
             reranked = self._rank_official(starts + local, benchmark)
             starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
@@ -150,6 +164,22 @@ class DreamPlaceHybridOptimizer:
             rows.append((score, pos))
         return sorted(rows, key=lambda item: item[0])
 
+    def _log_proxy_calibration(self, placement: torch.Tensor, benchmark, ctx) -> None:
+        plc = load_plc_for_benchmark(benchmark.name)
+        if plc is None:
+            return
+        official = compute_proxy_cost(placement, benchmark, plc)
+        evaluator = TorchProxyCostEvaluator(ctx)
+        with torch.no_grad():
+            proxy = evaluator.evaluate_batch(placement.to(self.device, dtype=torch.float32))
+        print(
+            f"[dreamplace_gpu] calibration "
+            f"official_cong={float(official['congestion_cost']):.6f} "
+            f"torch_cong={float(proxy.congestion_cost.view(-1)[0].item()):.6f} "
+            f"official_proxy={float(official['proxy_cost']):.6f} "
+            f"torch_proxy={float(proxy.official_proxy.view(-1)[0].item()):.6f}"
+        )
+
     def _unique_candidates(self, candidates: list[torch.Tensor]) -> list[torch.Tensor]:
         out: list[torch.Tensor] = []
         seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
@@ -175,12 +205,7 @@ class DreamPlaceAnalyticalOptimizer:
         if trace is not None:
             trace.record(base, "initial")
 
-        recipes = (
-            (0.12, 0.018, 0.030, 0.78),
-            (0.18, 0.025, 0.035, 0.82),
-            (0.28, 0.035, 0.030, 0.88),
-        )
-        for recipe_idx, (density_weight, gamma_scale, lr_scale, target_density) in enumerate(recipes):
+        for recipe_idx, (density_weight, gamma_scale, lr_scale, target_density) in enumerate(self.config.recipes):
             pos = self._run_one(
                 benchmark,
                 base,
@@ -217,17 +242,35 @@ class DreamPlaceAnalyticalOptimizer:
         opt = torch.optim.Adam([x], lr=lr_scale * max(float(benchmark.canvas_width), float(benchmark.canvas_height)))
         best = x.detach().clone()
         best_loss = float("inf")
+        detached_congestion_map = None
+        loss_breakdown = None
 
         for step in range(max(int(self.config.analytical_iters), 1)):
             opt.zero_grad(set_to_none=True)
             frac = step / max(float(self.config.analytical_iters - 1), 1.0)
             gamma = gamma_scale * (1.0 - 0.65 * frac) * max(float(benchmark.canvas_width), float(benchmark.canvas_height))
             gamma = max(gamma, 1.0e-3)
+            rows, cols = self._bin_grid_shape(benchmark)
+            if self.config.congestion_density_alpha > 0 and self.config.congestion_map_update_interval > 0:
+                if step % int(self.config.congestion_map_update_interval) == 0 or detached_congestion_map is None:
+                    with torch.no_grad():
+                        congestion_map = self._discrete_congestion_map(x.detach(), benchmark, sizes, rows, cols)
+                        detached_congestion_map = self._density_target_from_congestion(congestion_map, target_density)
             wl = self._weighted_average_wirelength(x, benchmark, gamma)
-            density = self._density_loss(x, benchmark, sizes, target_density)
+            density = self._density_loss(x, benchmark, sizes, target_density, detached_congestion_map)
+            macro_congestion = self._macro_blockage_congestion_loss(x, benchmark, sizes, rows, cols)
+            soft_route_congestion = self._soft_route_congestion_loss(x, benchmark, rows, cols)
             overlap = self._overlap_loss(x, benchmark, sizes)
             boundary = self._boundary_loss(x, benchmark, sizes)
-            loss = wl + density_weight * density + self.config.overlap_weight * overlap + self.config.boundary_weight * boundary
+            loss = (
+                wl
+                + density_weight * density
+                + self.config.congestion_weight * macro_congestion
+                + self.config.soft_route_congestion_weight * soft_route_congestion
+                + self.config.overlap_weight * overlap
+                + self.config.boundary_weight * boundary
+            )
+            loss_breakdown = (wl, density, macro_congestion, soft_route_congestion, overlap, boundary)
             loss.backward()
             with torch.no_grad():
                 if x.grad is not None:
@@ -245,6 +288,17 @@ class DreamPlaceAnalyticalOptimizer:
                     trace.record(x.detach(), f"recipe_{recipe_idx}_step_{step:04d}")
         if trace is not None:
             trace.record(best.detach(), f"recipe_{recipe_idx}_best")
+        if loss_breakdown is not None:
+            wl, density, macro_congestion, soft_route_congestion, overlap, boundary = loss_breakdown
+            print(
+                f"[dreamplace_gpu] recipe={recipe_idx} "
+                f"wl={float(wl.detach().item()):.6f} "
+                f"density={float(density.detach().item()):.6f} "
+                f"macro_cong={float(macro_congestion.detach().item()):.6f} "
+                f"soft_route_cong={float(soft_route_congestion.detach().item()):.6f} "
+                f"overlap={float(overlap.detach().item()):.6f} "
+                f"boundary={float(boundary.detach().item()):.6f}"
+            )
         return best
 
     def _pin_positions(self, placement: torch.Tensor):
@@ -282,9 +336,15 @@ class DreamPlaceAnalyticalOptimizer:
         xen = torch.zeros((num_nets,), dtype=coord.dtype, device=self.device).scatter_add_(0, net_ids, coord * en)
         return xep / sump.clamp_min(1.0e-12) - xen / sumn.clamp_min(1.0e-12)
 
-    def _density_loss(self, placement: torch.Tensor, benchmark, sizes: torch.Tensor, target_density: float) -> torch.Tensor:
-        rows = max(1, min(int(benchmark.grid_rows), int(self.config.bin_grid_cap)))
-        cols = max(1, min(int(benchmark.grid_cols), int(self.config.bin_grid_cap)))
+    def _density_loss(
+        self,
+        placement: torch.Tensor,
+        benchmark,
+        sizes: torch.Tensor,
+        target_density: float,
+        target_density_map: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        rows, cols = self._bin_grid_shape(benchmark)
         if rows * cols <= 1:
             return placement.new_tensor(0.0)
         grid = self._grid_boxes(benchmark, rows, cols, placement.dtype)
@@ -299,9 +359,104 @@ class DreamPlaceAnalyticalOptimizer:
         ).clamp_min(0)
         bin_area = (float(benchmark.canvas_width) / cols) * (float(benchmark.canvas_height) / rows)
         density = (x_overlap * y_overlap).sum(dim=0) / max(bin_area, 1.0e-9)
-        overflow = (density - target_density).clamp_min(0)
+        if target_density_map is None:
+            target = placement.new_full((rows * cols,), float(target_density))
+        else:
+            target = target_density_map.to(device=self.device, dtype=placement.dtype)
+        overflow = (density - target).clamp_min(0)
         k = max(int(overflow.numel() * 0.10), 1)
         return torch.topk(overflow.square(), k=k).values.mean()
+
+    def _macro_blockage_congestion_loss(
+        self,
+        placement: torch.Tensor,
+        benchmark,
+        sizes: torch.Tensor,
+        rows: int,
+        cols: int,
+    ) -> torch.Tensor:
+        n = int(benchmark.num_hard_macros)
+        if n <= 0 or rows * cols <= 1:
+            return placement.new_tensor(0.0)
+        grid_w = float(benchmark.canvas_width) / max(cols, 1)
+        grid_h = float(benchmark.canvas_height) / max(rows, 1)
+        grid_v_routes = max(grid_w * float(benchmark.vroutes_per_micron), 1.0e-9)
+        grid_h_routes = max(grid_h * float(benchmark.hroutes_per_micron), 1.0e-9)
+        v_macro, h_macro = self._macro_blockage_maps(
+            placement, benchmark, sizes, rows, cols, grid_v_routes, grid_h_routes
+        )
+        pressure = torch.cat([v_macro.reshape(-1), h_macro.reshape(-1)])
+        overflow = (pressure - float(self.config.congestion_target)).clamp_min(0).square()
+        k = max(int(overflow.numel() * 0.10), 1)
+        return torch.topk(overflow, k=k).values.mean()
+
+    def _soft_route_congestion_loss(self, placement: torch.Tensor, benchmark, rows: int, cols: int) -> torch.Tensor:
+        ctx = self.ctx
+        pair_count = int(ctx.routing_weights.numel())
+        if pair_count == 0 or rows * cols <= 1 or self.config.soft_route_congestion_weight <= 0:
+            return placement.new_tensor(0.0)
+        src = self._routing_pin_positions(
+            placement,
+            ctx.routing_src_parent,
+            ctx.routing_src_offset,
+            ctx.routing_src_port_pos,
+            ctx.routing_src_is_port,
+        )
+        dst = self._routing_pin_positions(
+            placement,
+            ctx.routing_dst_parent,
+            ctx.routing_dst_offset,
+            ctx.routing_dst_port_pos,
+            ctx.routing_dst_is_port,
+        )
+        grid_w = float(benchmark.canvas_width) / max(cols, 1)
+        grid_h = float(benchmark.canvas_height) / max(rows, 1)
+        tau_x = max(grid_w * float(self.config.soft_route_tau_scale), 1.0e-3)
+        tau_y = max(grid_h * float(self.config.soft_route_tau_scale), 1.0e-3)
+        col_centers = torch.linspace(
+            grid_w * 0.5,
+            float(benchmark.canvas_width) - grid_w * 0.5,
+            cols,
+            device=self.device,
+            dtype=placement.dtype,
+        )
+        row_centers = torch.linspace(
+            grid_h * 0.5,
+            float(benchmark.canvas_height) - grid_h * 0.5,
+            rows,
+            device=self.device,
+            dtype=placement.dtype,
+        )
+        h = placement.new_zeros((rows, cols))
+        v = placement.new_zeros((rows, cols))
+        chunk_size = max(int(self.config.soft_route_chunk_size), 1)
+        for start in range(0, pair_count, chunk_size):
+            end = min(start + chunk_size, pair_count)
+            src_c = src[start:end]
+            dst_c = dst[start:end]
+            weights = ctx.routing_weights[start:end].to(dtype=placement.dtype).view(-1, 1, 1)
+            x_min = torch.minimum(src_c[:, 0], dst_c[:, 0]).view(-1, 1)
+            x_max = torch.maximum(src_c[:, 0], dst_c[:, 0]).view(-1, 1)
+            y_min = torch.minimum(src_c[:, 1], dst_c[:, 1]).view(-1, 1)
+            y_max = torch.maximum(src_c[:, 1], dst_c[:, 1]).view(-1, 1)
+            h_window = torch.sigmoid((col_centers.view(1, -1) - x_min) / tau_x) * torch.sigmoid(
+                (x_max - col_centers.view(1, -1)) / tau_x
+            )
+            v_window = torch.sigmoid((row_centers.view(1, -1) - y_min) / tau_y) * torch.sigmoid(
+                (y_max - row_centers.view(1, -1)) / tau_y
+            )
+            h_row = torch.softmax(-0.5 * ((row_centers.view(1, -1) - src_c[:, 1].view(-1, 1)) / tau_y).square(), dim=1)
+            v_col = torch.softmax(-0.5 * ((col_centers.view(1, -1) - dst_c[:, 0].view(-1, 1)) / tau_x).square(), dim=1)
+            h = h + (weights * h_row.unsqueeze(2) * h_window.unsqueeze(1)).sum(dim=0)
+            v = v + (weights * v_window.unsqueeze(2) * v_col.unsqueeze(1)).sum(dim=0)
+        grid_v_routes = max(grid_w * float(benchmark.vroutes_per_micron), 1.0e-9)
+        grid_h_routes = max(grid_h * float(benchmark.hroutes_per_micron), 1.0e-9)
+        h = self._smooth_h_matrix(h / grid_h_routes)
+        v = self._smooth_v_matrix(v / grid_v_routes)
+        pressure = torch.cat([v.reshape(-1), h.reshape(-1)])
+        overflow = (pressure - float(self.config.congestion_target)).clamp_min(0).square()
+        k = max(int(overflow.numel() * 0.10), 1)
+        return torch.topk(overflow, k=k).values.mean()
 
     def _overlap_loss(self, placement: torch.Tensor, benchmark, sizes: torch.Tensor) -> torch.Tensor:
         n = int(benchmark.num_hard_macros)
@@ -331,6 +486,130 @@ class DreamPlaceAnalyticalOptimizer:
             dim=1,
         )
 
+    def _discrete_congestion_map(
+        self,
+        placement: torch.Tensor,
+        benchmark,
+        sizes: torch.Tensor,
+        rows: int,
+        cols: int,
+    ) -> torch.Tensor:
+        ctx = self.ctx
+        if rows * cols == 0:
+            return placement.new_zeros((0,))
+        h = placement.new_zeros((rows, cols))
+        v = placement.new_zeros((rows, cols))
+        pair_count = int(ctx.routing_weights.numel())
+        grid_w = float(benchmark.canvas_width) / max(cols, 1)
+        grid_h = float(benchmark.canvas_height) / max(rows, 1)
+        if pair_count > 0:
+            src = self._routing_pin_positions(
+                placement,
+                ctx.routing_src_parent,
+                ctx.routing_src_offset,
+                ctx.routing_src_port_pos,
+                ctx.routing_src_is_port,
+            )
+            dst = self._routing_pin_positions(
+                placement,
+                ctx.routing_dst_parent,
+                ctx.routing_dst_offset,
+                ctx.routing_dst_port_pos,
+                ctx.routing_dst_is_port,
+            )
+            src_col = torch.floor(src[:, 0] / max(grid_w, 1.0e-9)).to(torch.long).clamp(0, cols - 1)
+            dst_col = torch.floor(dst[:, 0] / max(grid_w, 1.0e-9)).to(torch.long).clamp(0, cols - 1)
+            src_row = torch.floor(src[:, 1] / max(grid_h, 1.0e-9)).to(torch.long).clamp(0, rows - 1)
+            dst_row = torch.floor(dst[:, 1] / max(grid_h, 1.0e-9)).to(torch.long).clamp(0, rows - 1)
+            weights = ctx.routing_weights.to(dtype=placement.dtype)
+            for idx in range(pair_count):
+                c0 = int(torch.minimum(src_col[idx], dst_col[idx]).item())
+                c1 = int(torch.maximum(src_col[idx], dst_col[idx]).item())
+                r0 = int(torch.minimum(src_row[idx], dst_row[idx]).item())
+                r1 = int(torch.maximum(src_row[idx], dst_row[idx]).item())
+                weight = weights[idx]
+                if c1 > c0:
+                    h[int(src_row[idx].item()), c0:c1] += weight
+                if r1 > r0:
+                    v[r0:r1, int(dst_col[idx].item())] += weight
+        grid_v_routes = max(grid_w * float(benchmark.vroutes_per_micron), 1.0e-9)
+        grid_h_routes = max(grid_h * float(benchmark.hroutes_per_micron), 1.0e-9)
+        h = self._smooth_h_matrix(h / grid_h_routes)
+        v = self._smooth_v_matrix(v / grid_v_routes)
+        v_macro, h_macro = self._macro_blockage_maps(placement, benchmark, sizes, rows, cols, grid_v_routes, grid_h_routes)
+        return torch.maximum(v + v_macro, h + h_macro).reshape(-1).detach()
+
+    def _density_target_from_congestion(self, congestion_map: torch.Tensor, target_density: float) -> torch.Tensor:
+        if congestion_map.numel() == 0:
+            return congestion_map
+        target = float(target_density) / (1.0 + float(self.config.congestion_density_alpha) * congestion_map.clamp_min(0))
+        return target.clamp(min=float(target_density) * 0.35, max=float(target_density)).detach()
+
+    def _macro_blockage_maps(
+        self,
+        placement: torch.Tensor,
+        benchmark,
+        sizes: torch.Tensor,
+        rows: int,
+        cols: int,
+        grid_v_routes: float,
+        grid_h_routes: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n = int(benchmark.num_hard_macros)
+        if n <= 0:
+            z = placement.new_zeros((rows, cols))
+            return z, z
+        grid = self._grid_boxes(benchmark, rows, cols, placement.dtype)
+        boxes = self._macro_boxes(placement[:n], sizes[:n])
+        x_overlap = (
+            torch.minimum(boxes[:, 2].unsqueeze(1), grid[:, 2].unsqueeze(0))
+            - torch.maximum(boxes[:, 0].unsqueeze(1), grid[:, 0].unsqueeze(0))
+        ).clamp_min(0)
+        y_overlap = (
+            torch.minimum(boxes[:, 3].unsqueeze(1), grid[:, 3].unsqueeze(0))
+            - torch.maximum(boxes[:, 1].unsqueeze(1), grid[:, 1].unsqueeze(0))
+        ).clamp_min(0)
+        v = (x_overlap * float(self.ctx.vrouting_alloc)).sum(dim=0).reshape(rows, cols) / grid_v_routes
+        h = (y_overlap * float(self.ctx.hrouting_alloc)).sum(dim=0).reshape(rows, cols) / grid_h_routes
+        return v, h
+
+    def _routing_pin_positions(
+        self,
+        placement: torch.Tensor,
+        parent: torch.Tensor,
+        offset: torch.Tensor,
+        port_pos: torch.Tensor,
+        is_port: torch.Tensor,
+    ) -> torch.Tensor:
+        if parent.numel() == 0:
+            return torch.zeros((0, 2), dtype=placement.dtype, device=self.device)
+        gathered = placement[parent.clamp_min(0)] + offset.to(dtype=placement.dtype)
+        return torch.where(is_port.view(-1, 1), port_pos.to(dtype=placement.dtype), gathered)
+
+    def _smooth_v_matrix(self, v: torch.Tensor) -> torch.Tensor:
+        r = max(int(self.ctx.smooth_range), 0)
+        if r == 0:
+            return v
+        _, cols = v.shape
+        out = torch.zeros_like(v)
+        for col in range(cols):
+            lp = max(0, col - r)
+            rp = min(cols - 1, col + r)
+            out[:, lp : rp + 1] += v[:, col : col + 1] / float(rp - lp + 1)
+        return out
+
+    def _smooth_h_matrix(self, h: torch.Tensor) -> torch.Tensor:
+        r = max(int(self.ctx.smooth_range), 0)
+        if r == 0:
+            return h
+        rows, _ = h.shape
+        out = torch.zeros_like(h)
+        for row in range(rows):
+            lp = max(0, row - r)
+            rp = min(rows - 1, row + r)
+            out[lp : rp + 1, :] += h[row : row + 1, :] / float(rp - lp + 1)
+        return out
+
     def _grid_boxes(self, benchmark, rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
         xs = torch.linspace(0, float(benchmark.canvas_width), cols + 1, device=self.device, dtype=dtype)
         ys = torch.linspace(0, float(benchmark.canvas_height), rows + 1, device=self.device, dtype=dtype)
@@ -339,6 +618,11 @@ class DreamPlaceAnalyticalOptimizer:
             for c in range(cols):
                 boxes.append(torch.stack([xs[c], ys[r], xs[c + 1], ys[r + 1]]))
         return torch.stack(boxes, dim=0)
+
+    def _bin_grid_shape(self, benchmark) -> tuple[int, int]:
+        rows = max(1, min(int(benchmark.grid_rows), int(self.config.bin_grid_cap)))
+        cols = max(1, min(int(benchmark.grid_cols), int(self.config.bin_grid_cap)))
+        return rows, cols
 
     def _project_(self, placement: torch.Tensor, benchmark, sizes: torch.Tensor, fixed: torch.Tensor, original: torch.Tensor) -> None:
         placement[:, 0].clamp_(sizes[:, 0] / 2, float(benchmark.canvas_width) - sizes[:, 0] / 2)

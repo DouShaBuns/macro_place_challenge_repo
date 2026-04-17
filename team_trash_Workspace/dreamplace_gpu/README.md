@@ -8,11 +8,17 @@ implements the relevant ideas directly in PyTorch:
 
 - weighted-average wirelength over the extracted pin-level netlist
 - bin density overflow
+- congestion-aware analytical losses
 - hard-macro overlap and boundary penalties
 - Nesterov/Adam continuous optimization
 - legalization
-- SA-style refinement from analytical warm starts
+- optional SA-style refinement from analytical warm starts
 - official `compute_proxy_cost` reranking
+
+The default mode is strict pure analytical: analytical candidates are generated,
+legalized, reranked with the official proxy cost, and returned. SA refinement and
+post-legalization local coordinate refinement are both disabled unless explicitly
+enabled with environment variables.
 
 Run:
 
@@ -27,9 +33,23 @@ Useful knobs:
 ```powershell
 $env:DP_DEVICE='cuda'
 $env:DP_ANALYTICAL_ITERS='260'
+$env:DP_RECIPES='0.12,0.018,0.030,0.78;0.18,0.025,0.035,0.82;0.28,0.035,0.030,0.88'
+$env:DP_CONGESTION_WEIGHT='0.05'
+$env:DP_CONGESTION_TARGET='0.85'
+$env:DP_CONGESTION_DENSITY_ALPHA='0.15'
+$env:DP_CONGESTION_MAP_UPDATE_INTERVAL='20'
+$env:DP_SOFT_ROUTE_CONGESTION_WEIGHT='0.02'
+$env:DP_SOFT_ROUTE_TAU_SCALE='0.5'
+$env:DP_SOFT_ROUTE_CHUNK_SIZE='512'
+$env:DP_SEEDS='42,43,44,45'
+```
+
+Optional hybrid/refinement knobs:
+
+```powershell
+$env:DP_RUN_REFINE='1'
 $env:DP_REFINE_ITERS='80'
 $env:DP_REFINE_CANDIDATE_BATCH='16'
-$env:DP_SEEDS='42,43,44,45'
 $env:DP_LOCAL_REFINE_TRIALS='220'
 ```
 
@@ -39,7 +59,6 @@ Tracing is disabled by default. Enable it with environment variables before
 running the normal evaluator. For a pure analytical trace:
 
 ```powershell
-$env:DP_RUN_REFINE='0'
 $env:TRACE_PLACEMENT='1'
 $env:TRACE_EVERY='10'
 $env:TRACE_DIR='output/traces'
@@ -60,8 +79,8 @@ frames.
 
 ## Pure Analytical Full IBM Run 2026-04-16
 
-This run disables the SA-style refinement stage and records the current
-analytical-only baseline before optimization.
+This historical run disabled the SA-style refinement stage and recorded the
+analytical-only baseline before congestion-aware analytical losses were added.
 
 Environment:
 
@@ -75,7 +94,6 @@ GPU = NVIDIA GeForce RTX 4060 Laptop GPU
 Command:
 
 ```powershell
-$env:DP_RUN_REFINE='0'
 $env:DP_DEVICE='cuda:0'
 uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py --all --out team_trash_Workspace/dreamplace_gpu/results/analytical_only_full_20260416_142548.jsonl
 ```
@@ -199,4 +217,4 @@ Interpretation:
 
 - The optimized run preserves legality: every benchmark is valid with zero hard-macro overlap.
 - The proxy improvement is real but very small: average proxy improves from `1.4930` to `1.4929`.
-- The local refinement default is expensive on large benchmarks; use `DP_LOCAL_REFINE_TRIALS=0` to reproduce the faster pre-optimization analytical behavior.
+- Local refinement is now optional and disabled by default; use `DP_LOCAL_REFINE_TRIALS=220` only when intentionally reproducing the older local-refine experiment.
