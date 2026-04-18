@@ -5,6 +5,7 @@ Leverages the existing MacroPlacement parser instead of reimplementing.
 """
 
 import os
+from pathlib import Path
 import torch
 from typing import Optional, Tuple
 
@@ -27,6 +28,11 @@ def load_benchmark(
         Tuple of (Benchmark, PlacementCost) - Benchmark contains PyTorch tensors,
         PlacementCost object is needed for cost computation
     """
+    # PlacementCost assumes POSIX separators internally even on Windows.
+    netlist_file = Path(netlist_file).as_posix()
+    if plc_file is not None:
+        plc_file = Path(plc_file).as_posix()
+
     # Initialize PlacementCost (parses netlist)
     plc = PlacementCost(netlist_file)
 
@@ -196,8 +202,9 @@ def load_benchmark_from_dir(benchmark_dir: str) -> Tuple[Benchmark, PlacementCos
     Returns:
         Tuple of (Benchmark, PlacementCost)
     """
-    netlist_file = os.path.join(benchmark_dir, "netlist.pb.txt")
-    plc_file = os.path.join(benchmark_dir, "initial.plc")
+    benchmark_path = Path(benchmark_dir)
+    netlist_file = (benchmark_path / "netlist.pb.txt").as_posix()
+    plc_file = (benchmark_path / "initial.plc").as_posix()
 
     if not os.path.exists(netlist_file):
         raise FileNotFoundError(f"Netlist not found: {netlist_file}")

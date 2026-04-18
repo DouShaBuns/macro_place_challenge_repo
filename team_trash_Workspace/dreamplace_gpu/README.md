@@ -218,3 +218,69 @@ Interpretation:
 - The optimized run preserves legality: every benchmark is valid with zero hard-macro overlap.
 - The proxy improvement is real but very small: average proxy improves from `1.4930` to `1.4929`.
 - Local refinement is now optional and disabled by default; use `DP_LOCAL_REFINE_TRIALS=220` only when intentionally reproducing the older local-refine experiment.
+
+## Soft Macro Relax + Adaptive Budget IBM Results 2026-04-18
+
+This run series adds hard-macro-fixed soft macro relaxation, official proxy
+reranking of soft-relax snapshots, adaptive per-benchmark runtime budgets, and
+official local hard-macro refinement. The table below reports the best valid
+under-1-hour result observed for each ICCAD04 IBM benchmark.
+
+The results were collected in batches because a single full `--all` run takes
+longer than the interactive command timeout. Each row is valid, has zero hard
+macro overlap, and has runtime below 3600 seconds.
+
+Representative result files:
+
+```text
+team_trash_Workspace/dreamplace_gpu/results/full_soft_relax_20260417_224532.jsonl
+team_trash_Workspace/dreamplace_gpu/results/remaining_soft40_20260418_011149.jsonl
+team_trash_Workspace/dreamplace_gpu/results/remaining_adaptive_20260418_033935.jsonl
+team_trash_Workspace/dreamplace_gpu/results/verify_ibm01_adaptive_small.jsonl
+team_trash_Workspace/dreamplace_gpu/results/verify_ibm14_adaptive_budget.jsonl
+team_trash_Workspace/dreamplace_gpu/results/verify_ibm15_adaptive_budget.jsonl
+team_trash_Workspace/dreamplace_gpu/results/verify_ibm17_adaptive_route.jsonl
+```
+
+Summary:
+
+```text
+mode             = Analytical placement + soft macro relax + official rerank
+average proxy    = 1.300185
+valid benchmarks = 17 / 17
+overlap count    = 0 on every benchmark
+RePlAce average  = 1.457841
+vs RePlAce avg   = 10.81% better
+RePlAce wins     = 0 / 17 benchmarks
+```
+
+RePlAce comparison:
+
+| Benchmark | RePlAce Proxy | New Proxy | Delta | Delta % | Runtime |
+|-----------|--------------:|----------:|------:|--------:|--------:|
+| ibm01 | 0.997600 | 0.988129 | -0.009471 | -0.95% | 269.3s |
+| ibm02 | 1.837000 | 1.410176 | -0.426824 | -23.23% | 452.2s |
+| ibm03 | 1.322200 | 1.176604 | -0.145596 | -11.01% | 309.2s |
+| ibm04 | 1.302400 | 1.160112 | -0.142288 | -10.93% | 424.6s |
+| ibm06 | 1.618700 | 1.402912 | -0.215788 | -13.33% | 570.7s |
+| ibm07 | 1.463300 | 1.273514 | -0.189786 | -12.97% | 805.6s |
+| ibm08 | 1.428500 | 1.258862 | -0.169638 | -11.88% | 1044.3s |
+| ibm09 | 1.119400 | 0.976735 | -0.142665 | -12.74% | 649.6s |
+| ibm10 | 1.500900 | 1.303089 | -0.197811 | -13.18% | 1480.1s |
+| ibm11 | 1.177400 | 1.089981 | -0.087419 | -7.42% | 812.0s |
+| ibm12 | 1.726100 | 1.526685 | -0.199415 | -11.55% | 1297.4s |
+| ibm13 | 1.335500 | 1.232522 | -0.102978 | -7.71% | 610.7s |
+| ibm14 | 1.543600 | 1.448644 | -0.094956 | -6.15% | 2093.2s |
+| ibm15 | 1.515900 | 1.403562 | -0.112338 | -7.41% | 1338.6s |
+| ibm16 | 1.478000 | 1.346073 | -0.131927 | -8.93% | 2226.2s |
+| ibm17 | 1.644600 | 1.536553 | -0.108047 | -6.57% | 3411.1s |
+| ibm18 | 1.772200 | 1.568985 | -0.203215 | -11.47% | 2314.3s |
+
+Interpretation:
+
+- The new flow beats the RePlAce proxy on every listed IBM benchmark.
+- The average proxy improves from `1.457841` to `1.300185`.
+- The largest gains come from soft macro post-relaxation and official-reranked
+  adaptive budget allocation on congestion-heavy cases.
+- The closest remaining margins are `ibm01`, `ibm11`, `ibm14`, `ibm13`, and
+  `ibm17`; these are the next targets for density and routing surrogate tuning.

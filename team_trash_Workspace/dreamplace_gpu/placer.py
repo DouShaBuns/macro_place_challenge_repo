@@ -34,6 +34,15 @@ def _parse_recipes(text: str | None) -> tuple[tuple[float, float, float, float],
     return tuple(recipes)
 
 
+def _parse_float_tuple(text: str | None, default: tuple[float, ...]) -> tuple[float, ...]:
+    if text is None or not text.strip():
+        return default
+    values = tuple(float(item.strip()) for item in text.split(",") if item.strip())
+    if not values:
+        raise ValueError("Expected at least one float value")
+    return values
+
+
 class DreamPlaceGPUPlacer:
     def __init__(self):
         seed_text = os.getenv("DP_SEEDS", "42,43,44,45")
@@ -57,6 +66,26 @@ class DreamPlaceGPUPlacer:
             optimize_soft_macros=os.getenv("DP_OPTIMIZE_SOFT", "1") != "0",
             run_refine=os.getenv("DP_RUN_REFINE", "0") != "0",
             local_refine_trials=int(os.getenv("DP_LOCAL_REFINE_TRIALS", "0")),
+            official_refine_evals=int(os.getenv("DP_OFFICIAL_REFINE_EVALS", "24")),
+            official_refine_macro_limit=int(os.getenv("DP_OFFICIAL_REFINE_MACRO_LIMIT", "1000")),
+            official_refine_rounds=int(os.getenv("DP_OFFICIAL_REFINE_ROUNDS", "1")),
+            official_refine_prefilter_chunk=int(os.getenv("DP_OFFICIAL_REFINE_PREFILTER_CHUNK", "64")),
+            official_refine_step_scales=_parse_float_tuple(
+                os.getenv("DP_OFFICIAL_REFINE_STEP_SCALES"),
+                (0.25, 0.5, 1.0),
+            ),
+            analytical_snapshot_interval=int(os.getenv("DP_ANALYTICAL_SNAPSHOT_INTERVAL", "20")),
+            analytical_snapshots_per_recipe=int(os.getenv("DP_ANALYTICAL_SNAPSHOTS_PER_RECIPE", "3")),
+            soft_relax_iters=int(os.getenv("DP_SOFT_RELAX_ITERS", "200")),
+            soft_relax_lr_scale=float(os.getenv("DP_SOFT_RELAX_LR_SCALE", "0.01")),
+            soft_relax_lr_scales=_parse_float_tuple(
+                os.getenv("DP_SOFT_RELAX_LR_SCALES"),
+                (0.005, 0.01),
+            ),
+            soft_relax_start_k=int(os.getenv("DP_SOFT_RELAX_START_K", "1")),
+            soft_relax_snapshot_interval=int(os.getenv("DP_SOFT_RELAX_SNAPSHOT_INTERVAL", "20")),
+            soft_relax_snapshots=int(os.getenv("DP_SOFT_RELAX_SNAPSHOTS", "8")),
+            adaptive_large_budget=os.getenv("DP_ADAPTIVE_LARGE_BUDGET", "1") != "0",
             **({"recipes": recipes} if recipes is not None else {}),
         )
         self.device = os.getenv("DP_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")

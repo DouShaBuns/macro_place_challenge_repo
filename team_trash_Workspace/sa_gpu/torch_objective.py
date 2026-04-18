@@ -250,8 +250,43 @@ class TorchProxyCostEvaluator:
             torch.minimum(macro_boxes[:, :, 3].unsqueeze(2), grid[:, 3].view(1, 1, -1))
             - torch.maximum(macro_boxes[:, :, 1].unsqueeze(2), grid[:, 1].view(1, 1, -1))
         ).clamp_min(0)
-        v = (x_overlap * float(self.ctx.vrouting_alloc)).sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_v_routes
-        h = (y_overlap * float(self.ctx.hrouting_alloc)).sum(dim=1).reshape(batch, self.grid_rows, self.grid_cols) / grid_h_routes
+        intersects = (x_overlap > 0) & (y_overlap > 0)
+        row_ids = torch.arange(self.grid_rows, device=self.device).repeat_interleave(self.grid_cols)
+        col_ids = torch.arange(self.grid_cols, device=self.device).repeat(self.grid_rows)
+        left = macro_boxes[:, :, 0]
+        right = macro_boxes[:, :, 2]
+        bottom = macro_boxes[:, :, 1]
+        top = macro_boxes[:, :, 3]
+        bl_col = torch.floor(left / max(self.grid_w, 1.0e-9)).to(torch.long).clamp(0, self.grid_cols - 1)
+        ur_col = torch.floor(right / max(self.grid_w, 1.0e-9)).to(torch.long).clamp(0, self.grid_cols - 1)
+        bl_row = torch.floor(bottom / max(self.grid_h, 1.0e-9)).to(torch.long).clamp(0, self.grid_rows - 1)
+        ur_row = torch.floor(top / max(self.grid_h, 1.0e-9)).to(torch.long).clamp(0, self.grid_rows - 1)
+        bottom_partial = y_overlap.gather(2, (bl_row * self.grid_cols + bl_col).unsqueeze(2)).squeeze(2)
+        top_partial = y_overlap.gather(2, (ur_row * self.grid_cols + bl_col).unsqueeze(2)).squeeze(2)
+        left_partial = x_overlap.gather(2, (bl_row * self.grid_cols + bl_col).unsqueeze(2)).squeeze(2)
+        right_partial = x_overlap.gather(2, (bl_row * self.grid_cols + ur_col).unsqueeze(2)).squeeze(2)
+        partial_v = (ur_row != bl_row) & (
+            ((bottom_partial - self.grid_h).abs() > 1.0e-5)
+            | ((top_partial - self.grid_h).abs() > 1.0e-5)
+        )
+        partial_h = (ur_col != bl_col) & (
+            ((left_partial - self.grid_w).abs() > 1.0e-5)
+            | ((right_partial - self.grid_w).abs() > 1.0e-5)
+        )
+        v_keep = intersects & ~(partial_v.unsqueeze(2) & (row_ids.view(1, 1, -1) == ur_row.unsqueeze(2)))
+        h_keep = intersects & ~(partial_h.unsqueeze(2) & (col_ids.view(1, 1, -1) == ur_col.unsqueeze(2)))
+        v = (
+            (x_overlap * v_keep.to(x_overlap.dtype) * float(self.ctx.vrouting_alloc))
+            .sum(dim=1)
+            .reshape(batch, self.grid_rows, self.grid_cols)
+            / grid_v_routes
+        )
+        h = (
+            (y_overlap * h_keep.to(y_overlap.dtype) * float(self.ctx.hrouting_alloc))
+            .sum(dim=1)
+            .reshape(batch, self.grid_rows, self.grid_cols)
+            / grid_h_routes
+        )
         return v, h
 
     def _smooth_v(self, v):
