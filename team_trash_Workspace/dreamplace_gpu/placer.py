@@ -65,6 +65,9 @@ class DreamPlaceGPUPlacer:
             boundary_weight=float(os.getenv("DP_BOUNDARY_WEIGHT", "25.0")),
             optimize_soft_macros=os.getenv("DP_OPTIMIZE_SOFT", "1") != "0",
             run_refine=os.getenv("DP_RUN_REFINE", "0") != "0",
+            top_k_candidates=int(os.getenv("DP_TOP_K_CANDIDATES", "8")),
+            official_rerank_limit=int(os.getenv("DP_OFFICIAL_RERANK_LIMIT", "0")),
+            max_gpu_batch_candidates=int(os.getenv("DP_MAX_GPU_BATCH_CANDIDATES", "0")),
             local_refine_trials=int(os.getenv("DP_LOCAL_REFINE_TRIALS", "0")),
             official_refine_evals=int(os.getenv("DP_OFFICIAL_REFINE_EVALS", "24")),
             official_refine_macro_limit=int(os.getenv("DP_OFFICIAL_REFINE_MACRO_LIMIT", "1000")),
@@ -86,6 +89,7 @@ class DreamPlaceGPUPlacer:
             soft_relax_snapshot_interval=int(os.getenv("DP_SOFT_RELAX_SNAPSHOT_INTERVAL", "20")),
             soft_relax_snapshots=int(os.getenv("DP_SOFT_RELAX_SNAPSHOTS", "8")),
             adaptive_large_budget=os.getenv("DP_ADAPTIVE_LARGE_BUDGET", "1") != "0",
+            log_proxy_calibration=os.getenv("DP_LOG_PROXY_CALIBRATION", "0") != "0",
             **({"recipes": recipes} if recipes is not None else {}),
         )
         self.device = os.getenv("DP_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")

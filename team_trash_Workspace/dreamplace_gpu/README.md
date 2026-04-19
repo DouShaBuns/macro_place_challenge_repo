@@ -20,12 +20,71 @@ legalized, reranked with the official proxy cost, and returned. SA refinement an
 post-legalization local coordinate refinement are both disabled unless explicitly
 enabled with environment variables.
 
-Run:
+## Current Status
+
+Current default flow:
+
+1. Generate analytical macro-placement candidates in PyTorch.
+2. Repair only illegal candidates; legal candidates are kept unchanged.
+3. Rerank candidates with the official `compute_proxy_cost`.
+4. Run hard-macro-fixed soft macro relaxation with adaptive per-design policy.
+5. Rerank soft-relax snapshots with the official proxy.
+6. Run official local hard-macro refinement only when the adaptive policy allows
+   it.
+
+The adaptive policy is based on benchmark features rather than benchmark names:
+`num_hard_macros`, `num_soft_macros`, total macro count, and official baseline
+congestion. This is intended to make unknown designs choose a reasonable budget
+without adding case-specific `ibmXX` rules.
+
+Current performance-tuned defaults:
+
+- PLC objects are cached in `BenchmarkContext` and reused inside a placement
+  run.
+- Official proxy calibration logging is disabled by default; enable it with
+  `DP_LOG_PROXY_CALIBRATION=1`.
+- Very large hard-macro cases skip official local refinement by default because
+  the measured proxy gain was tiny compared with the runtime cost.
+- Hard-macro overlap checking uses a hybrid implementation: scalar loop for
+  smaller cases, vectorized NumPy for larger cases.
+
+## Run Guide
+
+The project uses `uv` for local Python execution. Do not call bare `python` or
+`pip` for normal local runs.
+
+Single benchmark:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 $env:UV_CACHE_DIR='D:\workspace\partcl-macro-place-challenge\.uv-cache'
 uv run evaluate team_trash_Workspace/dreamplace_gpu/placer.py -b ibm01
+```
+
+Runner with JSONL output:
+
+```powershell
+$env:DP_DEVICE='cuda:0'
+uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py --benchmarks ibm01 --out team_trash_Workspace/dreamplace_gpu/results/latest.jsonl
+```
+
+All ICCAD04 IBM cases:
+
+```powershell
+$env:DP_DEVICE='cuda:0'
+uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py --all --out team_trash_Workspace/dreamplace_gpu/results/full_current.jsonl
+```
+
+Focused verification:
+
+```powershell
+uv run --extra dev pytest test team_trash_Workspace/sa_gpu/tests
+```
+
+Use this when you intentionally want diagnostic official/torch calibration logs:
+
+```powershell
+$env:DP_LOG_PROXY_CALIBRATION='1'
 ```
 
 Useful knobs:
@@ -42,7 +101,29 @@ $env:DP_SOFT_ROUTE_CONGESTION_WEIGHT='0.02'
 $env:DP_SOFT_ROUTE_TAU_SCALE='0.5'
 $env:DP_SOFT_ROUTE_CHUNK_SIZE='512'
 $env:DP_SEEDS='42,43,44,45'
+$env:DP_TOP_K_CANDIDATES='8'
+$env:DP_OFFICIAL_RERANK_LIMIT='0'
+$env:DP_MAX_GPU_BATCH_CANDIDATES='0'
+$env:DP_SOFT_RELAX_ITERS='200'
+$env:DP_SOFT_RELAX_LR_SCALES='0.005,0.01'
+$env:DP_OFFICIAL_REFINE_EVALS='24'
+$env:DP_ADAPTIVE_LARGE_BUDGET='1'
 ```
+
+Large-memory single-GPU starting point:
+
+```powershell
+$env:DP_SOFT_ROUTE_CHUNK_SIZE='1024'
+$env:DP_OFFICIAL_REFINE_PREFILTER_CHUNK='256'
+$env:DP_MAX_GPU_BATCH_CANDIDATES='256'
+```
+
+If GPU memory is still low and utilization is stable, try
+`DP_SOFT_ROUTE_CHUNK_SIZE=2048` and
+`DP_OFFICIAL_REFINE_PREFILTER_CHUNK=512`. `DP_OFFICIAL_RERANK_LIMIT=0`
+means the official rerank prefilter keeps `2 * DP_TOP_K_CANDIDATES`
+candidates when the candidate pool is larger than that; set an explicit larger
+value if you want more official `compute_proxy_cost` calls for quality.
 
 Optional hybrid/refinement knobs:
 
@@ -52,6 +133,19 @@ $env:DP_REFINE_ITERS='80'
 $env:DP_REFINE_CANDIDATE_BATCH='16'
 $env:DP_LOCAL_REFINE_TRIALS='220'
 ```
+
+## File Index
+
+| Path | Purpose |
+|------|---------|
+| `team_trash_Workspace/dreamplace_gpu/placer.py` | Challenge placer entry point; parses `DP_*` environment variables into `DreamPlaceConfig`. |
+| `team_trash_Workspace/dreamplace_gpu/optimizer.py` | Main analytical placement, soft macro relaxation, adaptive policy, official reranking, and local refinement logic. |
+| `team_trash_Workspace/dreamplace_gpu/parallel_runner.py` | Convenience runner for IBM/NG45 batches with JSONL output. |
+| `team_trash_Workspace/sa_gpu/benchmark_context.py` | Builds GPU-ready netlist/routing tensors and caches the official PLC object. |
+| `team_trash_Workspace/sa_gpu/torch_objective.py` | Torch proxy evaluator used for fast candidate screening and differentiable routing/density terms. |
+| `macro_place/objective.py` | Official `PlacementCost` wrapper and overlap metrics used for final scoring. |
+| `macro_place/loader.py` | Benchmark loader; normalizes paths for the official parser on Windows. |
+| `team_trash_Workspace/dreamplace_gpu/results/*.jsonl` | Recorded benchmark runs used for score comparisons. |
 
 ## Optimization Trace GIF
 
@@ -284,3 +378,67 @@ Interpretation:
   adaptive budget allocation on congestion-heavy cases.
 - The closest remaining margins are `ibm01`, `ibm11`, `ibm14`, `ibm13`, and
   `ibm17`; these are the next targets for density and routing surrogate tuning.
+
+## Performance-Tuned Current Defaults 2026-04-19
+
+This is the current working version after runtime tuning. It trades a very small
+amount of best-known proxy score for lower CPU-side stalls on large cases:
+
+- disables diagnostic proxy calibration by default;
+- reuses the parsed PLC from `BenchmarkContext`;
+- uses hybrid overlap checking;
+- skips official local refinement for `num_hard_macros >= 700` under adaptive
+  mode.
+- vectorizes the analytical congestion-map routing accumulation with chunked
+  dense tensor masks instead of one Python loop per routing pair;
+- batches Torch prefiltering before official rerank, with
+  `DP_MAX_GPU_BATCH_CANDIDATES` as an optional memory cap;
+- vectorizes SA-style candidate generation by move type when
+  `DP_RUN_REFINE=1`.
+
+Current expected full IBM average:
+
+```text
+mode             = Analytical placement + soft macro relax + adaptive runtime tuning
+average proxy    = 1.300402
+valid benchmarks = 17 / 17
+overlap count    = 0 on every benchmark
+RePlAce average  = 1.457841
+vs RePlAce avg   = 10.80% better
+```
+
+Compared with the 2026-04-18 best-quality table, the expected average changes
+from `1.300185` to `1.300402`. The difference is `+0.000217`, mainly because
+large-case official local refinement is skipped by default.
+
+Current expected per-benchmark proxy:
+
+| Benchmark | Current Proxy | Notes |
+|-----------|--------------:|-------|
+| ibm01 | 0.988710 | Re-run after performance tuning, 243.04s. |
+| ibm02 | 1.410176 | Same best valid result as previous table. |
+| ibm03 | 1.176604 | Same best valid result as previous table. |
+| ibm04 | 1.160112 | Same best valid result as previous table. |
+| ibm06 | 1.402912 | Same best valid result as previous table. |
+| ibm07 | 1.273514 | Same best valid result as previous table. |
+| ibm08 | 1.258862 | Same best valid result as previous table. |
+| ibm09 | 0.976735 | Same best valid result as previous table. |
+| ibm10 | 1.305628 | Re-run after skipping very-large official local refine, 784.09s. |
+| ibm11 | 1.089981 | Same best valid result as previous table. |
+| ibm12 | 1.526685 | Same best valid result as previous table. |
+| ibm13 | 1.232522 | Same best valid result as previous table. |
+| ibm14 | 1.448644 | Same best valid result as previous table. |
+| ibm15 | 1.403562 | Same best valid result as previous table. |
+| ibm16 | 1.346073 | Same best valid result as previous table. |
+| ibm17 | 1.537128 | Expected current behavior: soft-relax best, skipping official local refine. |
+| ibm18 | 1.568985 | Same best valid result as previous table. |
+
+Performance smoke checks:
+
+| Case | Check | Before | Current | Result |
+|------|-------|-------:|--------:|--------|
+| ibm01 | Normal short recipe soft-relax run | 269.31s | 243.04s | About 9.8% faster; proxy remains below RePlAce. |
+| ibm17 | One-iteration analytical smoke, soft relax disabled | 440.30s | 300.92s | About 31.7% faster after disabling calibration and large-case official refine. |
+
+Use `DP_ADAPTIVE_LARGE_BUDGET=0` if you want to reproduce the slower
+best-quality behavior with large-case official local refinement enabled.

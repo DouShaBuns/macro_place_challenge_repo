@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import torch
+import torch.nn.functional as F
 
 _HERE = Path(__file__).resolve().parent
 _SA_GPU = _HERE.parent / "sa_gpu"
@@ -42,6 +43,8 @@ class DreamPlaceConfig:
     optimize_soft_macros: bool = True
     run_refine: bool = False
     top_k_candidates: int = 8
+    official_rerank_limit: int = 0
+    max_gpu_batch_candidates: int = 0
     local_refine_trials: int = 0
     official_refine_evals: int = 24
     official_refine_macro_limit: int = 1000
@@ -57,6 +60,7 @@ class DreamPlaceConfig:
     soft_relax_snapshot_interval: int = 20
     soft_relax_snapshots: int = 8
     adaptive_large_budget: bool = True
+    log_proxy_calibration: bool = False
     recipes: tuple[tuple[float, float, float, float], ...] = (
         (0.12, 0.018, 0.030, 0.78),
         (0.18, 0.025, 0.035, 0.82),
@@ -81,26 +85,26 @@ class DreamPlaceHybridOptimizer:
         legalized.append(self._repair_candidate(benchmark.macro_positions, benchmark))
         legalized = self._unique_candidates(legalized)
 
-        ranked = self._rank_official(legalized, benchmark)
+        ranked = self._rank_official(legalized, benchmark, ctx)
         starts = [pos for _, pos in ranked[: max(1, min(self.config.top_k_candidates, len(ranked)))]]
         if trace is not None and starts:
             trace.record(starts[0], "legalized_best")
-        if starts:
+        if starts and self.config.log_proxy_calibration:
             self._log_proxy_calibration(starts[0], benchmark, ctx)
         local = self._local_refine_best(starts, benchmark, ctx) if self.config.local_refine_trials > 0 else []
         if local:
-            reranked = self._rank_official(starts + local, benchmark)
+            reranked = self._rank_official(starts + local, benchmark, ctx)
             starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
         soft_relaxed = []
         if starts and self.config.soft_relax_iters > 0:
             for start_pos in starts[: max(1, min(int(self.config.soft_relax_start_k), len(starts)))]:
                 soft_relaxed.extend(self._soft_relax_candidates(start_pos, benchmark, ctx))
         if soft_relaxed:
-            reranked = self._rank_official(starts + soft_relaxed, benchmark)
+            reranked = self._rank_official(starts + soft_relaxed, benchmark, ctx)
             starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
         official_local = self._official_refine_best(starts[0], benchmark, ctx) if starts and self.config.official_refine_evals > 0 else None
         if official_local is not None:
-            reranked = self._rank_official(starts + [official_local], benchmark)
+            reranked = self._rank_official(starts + [official_local], benchmark, ctx)
             starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
         if not self.config.run_refine or self.config.refine_iters <= 0:
             result = starts[0].cpu()
@@ -112,7 +116,7 @@ class DreamPlaceHybridOptimizer:
         refiner = AnalyticalSARefiner(self.config, self.device, ctx)
         refined = refiner.refine(benchmark, starts)
         all_final = starts + refined
-        ranked_final = self._rank_official(all_final, benchmark)
+        ranked_final = self._rank_official(all_final, benchmark, ctx)
         result = ranked_final[0][1].cpu()
         if trace is not None:
             trace.record(result, "final")
@@ -120,7 +124,7 @@ class DreamPlaceHybridOptimizer:
         return result
 
     def _local_refine_best(self, candidates: list[torch.Tensor], benchmark, ctx) -> list[torch.Tensor]:
-        ranked = self._rank_official(candidates, benchmark)
+        ranked = self._rank_official(candidates, benchmark, ctx)
         if not ranked:
             return []
         evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
@@ -188,7 +192,7 @@ class DreamPlaceHybridOptimizer:
     def _soft_relax_candidates(self, start: torch.Tensor, benchmark, ctx) -> list[torch.Tensor]:
         if int(benchmark.num_soft_macros) <= 0:
             return []
-        plc = load_plc_for_benchmark(benchmark.name)
+        plc = self._plc_for_benchmark(benchmark, ctx)
         if plc is None:
             return []
         baseline = compute_proxy_cost(start, benchmark, plc)
@@ -344,7 +348,7 @@ class DreamPlaceHybridOptimizer:
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n >= 700:
-            return min(budget, 4)
+            return 0
         if n >= 580:
             return min(budget, 8)
         if n >= 380:
@@ -353,8 +357,19 @@ class DreamPlaceHybridOptimizer:
             return min(budget, 8)
         return budget
 
+    def _official_refine_macro_limit(self, benchmark) -> int:
+        limit = max(1, int(self.config.official_refine_macro_limit))
+        if not self.config.adaptive_large_budget:
+            return limit
+        n = int(benchmark.num_hard_macros)
+        if n >= 700:
+            return min(limit, 192)
+        if n >= 580:
+            return min(limit, 384)
+        return limit
+
     def _official_refine_best(self, start: torch.Tensor, benchmark, ctx) -> torch.Tensor | None:
-        plc = load_plc_for_benchmark(benchmark.name)
+        plc = self._plc_for_benchmark(benchmark, ctx)
         if plc is None:
             return None
 
@@ -370,7 +385,7 @@ class DreamPlaceHybridOptimizer:
         if not movable:
             return None
         movable.sort(key=lambda i: -float(sizes[i, 0] * sizes[i, 1]))
-        macro_limit = max(1, int(self.config.official_refine_macro_limit))
+        macro_limit = self._official_refine_macro_limit(benchmark)
         movable = movable[: min(macro_limit, len(movable))]
 
         step_base = max(
@@ -391,30 +406,36 @@ class DreamPlaceHybridOptimizer:
         rounds = max(1, int(self.config.official_refine_rounds))
         official_budget = self._large_case_official_refine_budget(benchmark)
 
+        best_device = best.to(self.device, dtype=torch.float32)
+
         for round_idx in range(rounds):
             if official_budget <= 0:
                 break
-            candidates = []
-            for scale in self.config.official_refine_step_scales:
-                step = step_base * float(scale) * (0.5 ** round_idx)
-                for macro_idx in movable:
-                    for dx, dy in directions:
-                        cand = best.clone()
-                        cand[macro_idx, 0] += float(dx) * step
-                        cand[macro_idx, 1] += float(dy) * step
-                        candidates.append(clamp_placement(cand, benchmark))
-            if not candidates:
-                break
-
-            keep = min(official_budget, len(candidates))
-            scored: list[tuple[float, int]] = []
+            keep = official_budget
+            scored: list[tuple[float, tuple[int, float, float, float]]] = []
             chunk_size = max(1, int(self.config.official_refine_prefilter_chunk))
+            specs: list[tuple[int, float, float, float]] = []
             with torch.no_grad():
-                for start_idx in range(0, len(candidates), chunk_size):
-                    end_idx = min(start_idx + chunk_size, len(candidates))
-                    stacked = torch.stack(
-                        [c.to(self.device, dtype=torch.float32) for c in candidates[start_idx:end_idx]]
-                    )
+                for scale in self.config.official_refine_step_scales:
+                    step = step_base * float(scale) * (0.5 ** round_idx)
+                    for macro_idx in movable:
+                        for direction_idx, (dx, dy) in enumerate(directions):
+                            specs.append((macro_idx, step, float(dx), float(dy)))
+                            if len(specs) < chunk_size:
+                                continue
+                            stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
+                            costs = evaluator.evaluate_batch(stacked)
+                            search_score = torch.where(
+                                costs.is_legal,
+                                costs.search_score,
+                                torch.full_like(costs.search_score, torch.inf),
+                            )
+                            for offset, score in enumerate(search_score.detach().cpu().tolist()):
+                                if score != float("inf"):
+                                    scored.append((float(score), specs[offset]))
+                            specs = []
+                if specs:
+                    stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
                     costs = evaluator.evaluate_batch(stacked)
                     search_score = torch.where(
                         costs.is_legal,
@@ -423,16 +444,16 @@ class DreamPlaceHybridOptimizer:
                     )
                     for offset, score in enumerate(search_score.detach().cpu().tolist()):
                         if score != float("inf"):
-                            scored.append((float(score), start_idx + offset))
+                            scored.append((float(score), specs[offset]))
             if not scored:
                 break
             scored.sort(key=lambda item: item[0])
-            order = [idx for _, idx in scored[:keep]]
+            order = [spec for _, spec in scored[:keep]]
 
             round_best = best
             round_best_score = best_score
-            for idx in order:
-                cand = candidates[int(idx)]
+            for spec in order:
+                cand = self._materialize_official_refine_candidate(best, spec, benchmark)
                 official = compute_proxy_cost(cand, benchmark, plc)
                 official_budget -= 1
                 if int(official["overlap_count"]) != 0:
@@ -445,6 +466,7 @@ class DreamPlaceHybridOptimizer:
                     break
             if round_best_score < best_score:
                 best = round_best
+                best_device = best.to(self.device, dtype=torch.float32)
                 best_score = round_best_score
                 improved = True
             else:
@@ -455,27 +477,97 @@ class DreamPlaceHybridOptimizer:
             return best
         return None
 
-    def _rank_official(self, candidates: list[torch.Tensor], benchmark) -> list[tuple[float, torch.Tensor]]:
-        plc = load_plc_for_benchmark(benchmark.name)
-        if plc is None:
-            evaluator = TorchProxyCostEvaluator(build_benchmark_context(benchmark, self.device))
-            stacked = torch.stack([c.to(self.device, dtype=torch.float32) for c in candidates])
-            costs = evaluator.evaluate_batch(stacked)
-            rows = [
-                (float(costs.official_proxy[i].item()) if bool(costs.is_legal[i].item()) else float("inf"), candidates[i])
-                for i in range(len(candidates))
+    def _build_official_refine_chunk(
+        self,
+        base: torch.Tensor,
+        specs: list[tuple[int, float, float, float]],
+        sizes: torch.Tensor,
+        benchmark,
+    ) -> torch.Tensor:
+        stacked = base.unsqueeze(0).repeat(len(specs), 1, 1)
+        macro_idx = torch.tensor([item[0] for item in specs], dtype=torch.long, device=self.device)
+        delta = torch.tensor(
+            [[item[1] * item[2], item[1] * item[3]] for item in specs],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        rows = torch.arange(len(specs), dtype=torch.long, device=self.device)
+        stacked[rows, macro_idx] += delta
+        sizes = sizes.to(self.device, dtype=torch.float32)
+        stacked[:, :, 0].clamp_(sizes[:, 0] / 2, float(benchmark.canvas_width) - sizes[:, 0] / 2)
+        stacked[:, :, 1].clamp_(sizes[:, 1] / 2, float(benchmark.canvas_height) - sizes[:, 1] / 2)
+        return stacked
+
+    def _materialize_official_refine_candidate(
+        self,
+        base: torch.Tensor,
+        spec: tuple[int, float, float, float],
+        benchmark,
+    ) -> torch.Tensor:
+        macro_idx, step, dx, dy = spec
+        cand = base.clone()
+        cand[macro_idx, 0] += dx * step
+        cand[macro_idx, 1] += dy * step
+        return clamp_placement(cand, benchmark)
+
+    def _rank_official(self, candidates: list[torch.Tensor], benchmark, ctx=None) -> list[tuple[float, torch.Tensor]]:
+        plc = self._plc_for_benchmark(benchmark, ctx) if ctx is not None else load_plc_for_benchmark(benchmark.name)
+        evaluator_ctx = ctx if ctx is not None else build_benchmark_context(benchmark, self.device)
+        candidate_order = list(range(len(candidates)))
+        limit = int(self.config.official_rerank_limit)
+        if limit <= 0:
+            limit = max(1, int(self.config.top_k_candidates) * 2)
+        if len(candidates) > limit:
+            evaluator = TorchProxyCostEvaluator(evaluator_ctx)
+            torch_scores = self._score_torch_candidates(candidates, evaluator)
+            candidate_order = [
+                int(idx)
+                for _, idx in sorted(
+                    (score, idx) for idx, score in enumerate(torch_scores) if score != float("inf")
+                )[:limit]
             ]
+            if not candidate_order:
+                candidate_order = list(range(min(limit, len(candidates))))
+        if plc is None:
+            evaluator = TorchProxyCostEvaluator(evaluator_ctx)
+            torch_scores = self._score_torch_candidates(candidates, evaluator)
+            rows = [(torch_scores[i], candidates[i]) for i in range(len(candidates))]
             return sorted(rows, key=lambda item: item[0])
 
-        rows: list[tuple[float, torch.Tensor]] = []
-        for pos in candidates:
+        rows: list[tuple[float, torch.Tensor]] = [(float("inf"), pos) for pos in candidates]
+        for idx in candidate_order:
+            pos = candidates[idx]
             costs = compute_proxy_cost(pos, benchmark, plc)
             score = float(costs["proxy_cost"]) if int(costs["overlap_count"]) == 0 else float("inf")
-            rows.append((score, pos))
+            rows[idx] = (score, pos)
         return sorted(rows, key=lambda item: item[0])
 
+    def _score_torch_candidates(
+        self,
+        candidates: list[torch.Tensor],
+        evaluator: TorchProxyCostEvaluator,
+    ) -> list[float]:
+        if not candidates:
+            return []
+        batch_limit = max(int(self.config.max_gpu_batch_candidates), 0)
+        if batch_limit <= 0:
+            batch_limit = len(candidates)
+        scores: list[float] = []
+        with torch.no_grad():
+            for start in range(0, len(candidates), batch_limit):
+                chunk = candidates[start : start + batch_limit]
+                stacked = torch.stack([c.to(self.device, dtype=torch.float32) for c in chunk])
+                costs = evaluator.evaluate_batch(stacked)
+                chunk_scores = torch.where(
+                    costs.is_legal,
+                    costs.official_proxy,
+                    torch.full_like(costs.official_proxy, torch.inf),
+                )
+                scores.extend(float(x) for x in chunk_scores.detach().cpu().tolist())
+        return scores
+
     def _log_proxy_calibration(self, placement: torch.Tensor, benchmark, ctx) -> None:
-        plc = load_plc_for_benchmark(benchmark.name)
+        plc = self._plc_for_benchmark(benchmark, ctx)
         if plc is None:
             return
         official = compute_proxy_cost(placement, benchmark, plc)
@@ -489,6 +581,12 @@ class DreamPlaceHybridOptimizer:
             f"official_proxy={float(official['proxy_cost']):.6f} "
             f"torch_proxy={float(proxy.official_proxy.view(-1)[0].item()):.6f}"
         )
+
+    def _plc_for_benchmark(self, benchmark, ctx):
+        plc = getattr(ctx, "plc", None) if ctx is not None else None
+        if plc is None:
+            plc = load_plc_for_benchmark(benchmark.name)
+        return plc
 
     def _unique_candidates(self, candidates: list[torch.Tensor]) -> list[torch.Tensor]:
         out: list[torch.Tensor] = []
@@ -842,16 +940,22 @@ class DreamPlaceAnalyticalOptimizer:
             src_row = torch.floor(src[:, 1] / max(grid_h, 1.0e-9)).to(torch.long).clamp(0, rows - 1)
             dst_row = torch.floor(dst[:, 1] / max(grid_h, 1.0e-9)).to(torch.long).clamp(0, rows - 1)
             weights = ctx.routing_weights.to(dtype=placement.dtype)
-            for idx in range(pair_count):
-                c0 = int(torch.minimum(src_col[idx], dst_col[idx]).item())
-                c1 = int(torch.maximum(src_col[idx], dst_col[idx]).item())
-                r0 = int(torch.minimum(src_row[idx], dst_row[idx]).item())
-                r1 = int(torch.maximum(src_row[idx], dst_row[idx]).item())
-                weight = weights[idx]
-                if c1 > c0:
-                    h[int(src_row[idx].item()), c0:c1] += weight
-                if r1 > r0:
-                    v[r0:r1, int(dst_col[idx].item())] += weight
+            col_ids = torch.arange(cols, device=self.device).view(1, cols)
+            row_ids = torch.arange(rows, device=self.device).view(1, rows)
+            chunk_size = max(int(self.config.soft_route_chunk_size), 1)
+            for start in range(0, pair_count, chunk_size):
+                end = min(start + chunk_size, pair_count)
+                c0 = torch.minimum(src_col[start:end], dst_col[start:end]).view(-1, 1)
+                c1 = torch.maximum(src_col[start:end], dst_col[start:end]).view(-1, 1)
+                r0 = torch.minimum(src_row[start:end], dst_row[start:end]).view(-1, 1)
+                r1 = torch.maximum(src_row[start:end], dst_row[start:end]).view(-1, 1)
+                weight = weights[start:end].view(-1, 1, 1)
+                h_cols = (col_ids >= c0) & (col_ids < c1)
+                v_rows = (row_ids >= r0) & (row_ids < r1)
+                h_row_onehot = F.one_hot(src_row[start:end], num_classes=rows).to(dtype=placement.dtype)
+                v_col_onehot = F.one_hot(dst_col[start:end], num_classes=cols).to(dtype=placement.dtype)
+                h = h + (h_row_onehot.unsqueeze(2) * h_cols.unsqueeze(1).to(dtype=placement.dtype) * weight).sum(dim=0)
+                v = v + (v_rows.unsqueeze(2).to(dtype=placement.dtype) * v_col_onehot.unsqueeze(1) * weight).sum(dim=0)
         grid_v_routes = max(grid_w * float(benchmark.vroutes_per_micron), 1.0e-9)
         grid_h_routes = max(grid_h * float(benchmark.hroutes_per_micron), 1.0e-9)
         h = self._smooth_h_matrix(h / grid_h_routes)
@@ -1073,27 +1177,51 @@ class AnalyticalSARefiner:
         chosen_j = movable_idx[torch.randint(0, movable_idx.numel(), (total,), device=self.device, generator=generator)]
         scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height)) * max(temp, 1.0e-4)
         noise = torch.randn((total, 2), device=self.device, generator=generator) * scale
-        for row in range(total):
-            i = int(chosen_i[row].item())
-            j = int(chosen_j[row].item())
-            move = int(move_types[row].item())
-            if move == 0:
-                candidates[row, i] += noise[row]
-            elif move == 1 and i != j:
-                old_i = candidates[row, i].clone()
-                candidates[row, i] = candidates[row, j]
-                candidates[row, j] = old_i
-            elif move == 2 and i != j:
-                alpha = 0.08 + 0.30 * torch.rand((), device=self.device, generator=generator)
-                candidates[row, i] = candidates[row, i] + alpha * (candidates[row, j] - candidates[row, i])
-            elif move == 3:
-                candidates[row, i, 0] = torch.rand((), device=self.device, generator=generator) * float(benchmark.canvas_width)
-                candidates[row, i, 1] = torch.rand((), device=self.device, generator=generator) * float(benchmark.canvas_height)
-            else:
-                k = min(5, int(movable_idx.numel()))
-                perm_src = movable_idx[torch.randperm(movable_idx.numel(), device=self.device, generator=generator)[:k]]
-                perm_dst = perm_src[torch.randperm(k, device=self.device, generator=generator)]
-                candidates[row, perm_src] = candidates[row, perm_dst].clone()
+        rows = torch.arange(total, device=self.device)
+
+        move_mask = move_types == 0
+        if bool(move_mask.any()):
+            candidates[rows[move_mask], chosen_i[move_mask]] += noise[move_mask]
+
+        swap_mask = (move_types == 1) & (chosen_i != chosen_j)
+        if bool(swap_mask.any()):
+            swap_rows = rows[swap_mask]
+            i = chosen_i[swap_mask]
+            j = chosen_j[swap_mask]
+            old_i = candidates[swap_rows, i].clone()
+            candidates[swap_rows, i] = candidates[swap_rows, j]
+            candidates[swap_rows, j] = old_i
+
+        attract_mask = (move_types == 2) & (chosen_i != chosen_j)
+        if bool(attract_mask.any()):
+            attract_rows = rows[attract_mask]
+            i = chosen_i[attract_mask]
+            j = chosen_j[attract_mask]
+            alpha = 0.08 + 0.30 * torch.rand((int(attract_rows.numel()), 1), device=self.device, generator=generator)
+            candidates[attract_rows, i] = candidates[attract_rows, i] + alpha * (
+                candidates[attract_rows, j] - candidates[attract_rows, i]
+            )
+
+        random_mask = move_types == 3
+        if bool(random_mask.any()):
+            random_rows = rows[random_mask]
+            i = chosen_i[random_mask]
+            random_xy = torch.rand((int(random_rows.numel()), 2), device=self.device, generator=generator)
+            random_xy[:, 0] *= float(benchmark.canvas_width)
+            random_xy[:, 1] *= float(benchmark.canvas_height)
+            candidates[random_rows, i] = random_xy
+
+        perm_mask = move_types == 4
+        if bool(perm_mask.any()):
+            k = min(5, int(movable_idx.numel()))
+            perm_rows = rows[perm_mask]
+            if k > 1:
+                rand = torch.rand((int(perm_rows.numel()), int(movable_idx.numel())), device=self.device, generator=generator)
+                perm_src_pos = rand.topk(k=k, dim=1, largest=False).indices
+                perm_src = movable_idx[perm_src_pos]
+                dst_order = torch.rand((int(perm_rows.numel()), k), device=self.device, generator=generator).argsort(dim=1)
+                perm_dst = perm_src.gather(1, dst_order)
+                candidates[perm_rows.unsqueeze(1), perm_src] = candidates[perm_rows.unsqueeze(1), perm_dst].clone()
         half = sizes / 2
         candidates[:, :, 0] = candidates[:, :, 0].clamp(half[:, 0], float(benchmark.canvas_width) - half[:, 0])
         candidates[:, :, 1] = candidates[:, :, 1].clamp(half[:, 1], float(benchmark.canvas_height) - half[:, 1])
