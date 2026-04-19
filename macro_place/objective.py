@@ -5,8 +5,9 @@ Wraps PlacementCost methods to compute wirelength, density, and congestion costs
 Also computes overlap metrics for validation and analysis.
 """
 
-import torch
 import math
+import numpy as np
+import torch
 from typing import Dict, Optional
 
 from macro_place._plc import PlacementCost
@@ -65,42 +66,69 @@ def compute_overlap_metrics(
             "overlap_ratio": 0.0,
         }
 
-    # Extract positions and sizes
-    positions = placement.cpu().detach().numpy()  # [N, 2]
-    widths = benchmark.macro_sizes[:, 0].cpu().numpy()  # [N]
-    heights = benchmark.macro_sizes[:, 1].cpu().numpy()  # [N]
-
-    overlap_count = 0
-    total_overlap_area = 0.0
-    max_overlap_area = 0.0
-    macros_with_overlaps = set()
-
     # Check hard macro pairs only for overlap (soft macros naturally overlap)
     num_hard = getattr(benchmark, 'num_hard_macros', num_macros)
-    for i in range(num_hard):
-        for j in range(i + 1, num_hard):
-            # Calculate center-to-center distances
-            dx = abs(positions[i, 0] - positions[j, 0])
-            dy = abs(positions[i, 1] - positions[j, 1])
+    if num_hard <= 1:
+        return {
+            "overlap_count": 0,
+            "total_overlap_area": 0.0,
+            "max_overlap_area": 0.0,
+            "num_macros_with_overlaps": 0,
+            "overlap_ratio": 0.0,
+        }
 
-            # Minimum separation for non-overlap (sum of half-widths/heights)
-            min_sep_x = (widths[i] + widths[j]) / 2.0
-            min_sep_y = (heights[i] + heights[j]) / 2.0
+    # Extract positions and sizes. Keep the old scalar loop for small cases:
+    # allocating several dense NxN matrices is slower than pair iteration there.
+    positions = placement.detach().cpu().numpy()[:num_hard]
+    widths = benchmark.macro_sizes[:num_hard, 0].detach().cpu().numpy()
+    heights = benchmark.macro_sizes[:num_hard, 1].detach().cpu().numpy()
+    if num_hard < 512:
+        overlap_count = 0
+        total_overlap_area = 0.0
+        max_overlap_area = 0.0
+        macros_with_overlaps = set()
+        for i in range(num_hard):
+            for j in range(i + 1, num_hard):
+                dx = abs(positions[i, 0] - positions[j, 0])
+                dy = abs(positions[i, 1] - positions[j, 1])
+                overlap_x = max(0.0, (widths[i] + widths[j]) * 0.5 - dx)
+                overlap_y = max(0.0, (heights[i] + heights[j]) * 0.5 - dy)
+                if overlap_x > 0 and overlap_y > 0:
+                    overlap_area = overlap_x * overlap_y
+                    overlap_count += 1
+                    total_overlap_area += overlap_area
+                    max_overlap_area = max(max_overlap_area, overlap_area)
+                    macros_with_overlaps.add(i)
+                    macros_with_overlaps.add(j)
+        num_macros_with_overlaps = len(macros_with_overlaps)
+        overlap_ratio = num_macros_with_overlaps / num_macros if num_macros > 0 else 0.0
+        return {
+            "overlap_count": overlap_count,
+            "total_overlap_area": total_overlap_area,
+            "max_overlap_area": max_overlap_area,
+            "num_macros_with_overlaps": num_macros_with_overlaps,
+            "overlap_ratio": overlap_ratio,
+        }
 
-            # Calculate overlap amounts in each dimension
-            overlap_x = max(0.0, min_sep_x - dx)
-            overlap_y = max(0.0, min_sep_y - dy)
-
-            # Overlap occurs only if BOTH x and y overlap
-            if overlap_x > 0 and overlap_y > 0:
-                overlap_area = overlap_x * overlap_y
-                overlap_count += 1
-                total_overlap_area += overlap_area
-                max_overlap_area = max(max_overlap_area, overlap_area)
-                macros_with_overlaps.add(i)
-                macros_with_overlaps.add(j)
-
-    num_macros_with_overlaps = len(macros_with_overlaps)
+    dx = np.abs(positions[:, 0, None] - positions[None, :, 0])
+    dy = np.abs(positions[:, 1, None] - positions[None, :, 1])
+    min_sep_x = (widths[:, None] + widths[None, :]) * 0.5
+    min_sep_y = (heights[:, None] + heights[None, :]) * 0.5
+    overlap_x = np.maximum(0.0, min_sep_x - dx)
+    overlap_y = np.maximum(0.0, min_sep_y - dy)
+    overlap_area = overlap_x * overlap_y
+    pair_mask = np.triu(overlap_area > 0.0, k=1)
+    overlap_count = int(pair_mask.sum())
+    if overlap_count == 0:
+        total_overlap_area = 0.0
+        max_overlap_area = 0.0
+        num_macros_with_overlaps = 0
+    else:
+        pair_areas = overlap_area[pair_mask]
+        total_overlap_area = float(pair_areas.sum())
+        max_overlap_area = float(pair_areas.max())
+        involved = pair_mask.any(axis=0) | pair_mask.any(axis=1)
+        num_macros_with_overlaps = int(involved.sum())
     overlap_ratio = num_macros_with_overlaps / num_macros if num_macros > 0 else 0.0
 
     return {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -26,6 +26,7 @@ NG45_BENCHMARK_DIRS = {
 class BenchmarkContext:
     benchmark: Benchmark
     device: torch.device
+    plc: Any | None
     net_pin_parent: torch.Tensor
     net_pin_offset: torch.Tensor
     net_pin_port_pos: torch.Tensor
@@ -156,6 +157,7 @@ def build_benchmark_context(
     return BenchmarkContext(
         benchmark=benchmark,
         device=device,
+        plc=plc,
         net_pin_parent=_long(net_pin_parent, device),
         net_pin_offset=_float2(net_pin_offset, device),
         net_pin_port_pos=_float2(net_pin_port_pos, device),
@@ -216,6 +218,7 @@ def _build_context_from_benchmark_nets(benchmark: Benchmark, device: torch.devic
     return BenchmarkContext(
         benchmark=benchmark,
         device=device,
+        plc=None,
         net_pin_parent=_long(parents, device),
         net_pin_offset=_float2(offsets, device),
         net_pin_port_pos=_float2(ports, device),
