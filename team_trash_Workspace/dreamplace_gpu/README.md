@@ -78,7 +78,7 @@ uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py --all --out
 Focused verification:
 
 ```powershell
-uv run --extra dev pytest test team_trash_Workspace/sa_gpu/tests
+uv run --extra dev pytest team_trash_Workspace/dreamplace_gpu/tests
 ```
 
 Use this when you intentionally want diagnostic official/torch calibration logs:
@@ -141,8 +141,10 @@ $env:DP_LOCAL_REFINE_TRIALS='220'
 | `team_trash_Workspace/dreamplace_gpu/placer.py` | Challenge placer entry point; parses `DP_*` environment variables into `DreamPlaceConfig`. |
 | `team_trash_Workspace/dreamplace_gpu/optimizer.py` | Main analytical placement, soft macro relaxation, adaptive policy, official reranking, and local refinement logic. |
 | `team_trash_Workspace/dreamplace_gpu/parallel_runner.py` | Convenience runner for IBM/NG45 batches with JSONL output. |
-| `team_trash_Workspace/sa_gpu/benchmark_context.py` | Builds GPU-ready netlist/routing tensors and caches the official PLC object. |
-| `team_trash_Workspace/sa_gpu/torch_objective.py` | Torch proxy evaluator used for fast candidate screening and differentiable routing/density terms. |
+| `team_trash_Workspace/dreamplace_gpu/benchmark_context.py` | Builds GPU-ready netlist/routing tensors and caches the official PLC object. |
+| `team_trash_Workspace/dreamplace_gpu/torch_objective.py` | Torch proxy evaluator used for fast candidate screening and differentiable routing/density terms. |
+| `team_trash_Workspace/dreamplace_gpu/legalize.py` | Challenge-native legalization and canvas clamping helpers. |
+| `team_trash_Workspace/dreamplace_gpu/trace_utils.py` | Optional placement trace GIF recorder. |
 | `macro_place/objective.py` | Official `PlacementCost` wrapper and overlap metrics used for final scoring. |
 | `macro_place/loader.py` | Benchmark loader; normalizes paths for the official parser on Windows. |
 | `team_trash_Workspace/dreamplace_gpu/results/*.jsonl` | Recorded benchmark runs used for score comparisons. |
@@ -240,7 +242,7 @@ Commands:
 ```powershell
 $env:DP_RUN_REFINE='0'
 $env:DP_DEVICE='cuda:0'
-uv run --extra dev pytest team_trash_Workspace/sa_gpu/tests
+uv run --extra dev pytest team_trash_Workspace/dreamplace_gpu/tests
 uv run evaluate team_trash_Workspace/dreamplace_gpu/placer.py -b ibm01
 uv run evaluate team_trash_Workspace/dreamplace_gpu/placer.py -b ibm02
 uv run evaluate team_trash_Workspace/dreamplace_gpu/placer.py -b ibm10
@@ -442,3 +444,62 @@ Performance smoke checks:
 
 Use `DP_ADAPTIVE_LARGE_BUDGET=0` if you want to reproduce the slower
 best-quality behavior with large-case official local refinement enabled.
+
+## Latest Measured Full Run 2026-04-22
+
+Latest downloaded full-run artifact:
+
+```text
+team_trash_Workspace/dreamplace_gpu/results/full_shm_preempt_20260422T221418Z.jsonl
+```
+
+Configuration:
+
+```text
+mode                  = throughput + official-final-only
+scheduler             = dynamic GPU backfill with pause/resume
+checkpoint backend    = shm
+GPU jobs              = 1 primary + 1 opportunistic backfill
+```
+
+Measured summary:
+
+```text
+average proxy    = 1.273975
+average runtime  = 34.48 s / benchmark
+valid benchmarks = 17 / 17
+overlap count    = 0 on every benchmark
+```
+
+Interpretation:
+
+- This is the first full run with recoverable backfill pauses through shared
+  memory checkpoints (`/dev/shm` on Linux).
+- It is slightly worse than the earlier non-checkpoint throughput full run
+  (`1.272149`) by `+0.001826`, but still materially better than the older
+  runtime-tuned baseline (`1.300402`).
+- The scheduler path is now much closer to preemptive behavior: backfill work
+  is paused, checkpointed, and resumed instead of always being killed and
+  restarted from scratch.
+
+Measured per-benchmark proxy:
+
+| Benchmark | Proxy | Runtime | Launch Kind |
+|-----------|------:|--------:|-------------|
+| ibm01 | 0.996172 | 0.78s | backfill |
+| ibm02 | 1.406462 | 29.74s | backfill |
+| ibm03 | 1.158355 | 0.98s | backfill |
+| ibm04 | 1.155363 | 26.57s | backfill |
+| ibm06 | 1.388359 | 1.10s | backfill |
+| ibm07 | 1.278944 | 32.59s | backfill |
+| ibm08 | 1.252629 | 36.49s | backfill |
+| ibm09 | 0.987355 | 31.54s | backfill |
+| ibm10 | 1.265398 | 71.97s | primary |
+| ibm11 | 1.058859 | 23.80s | backfill |
+| ibm12 | 1.459537 | 57.19s | backfill |
+| ibm13 | 1.140109 | 25.74s | backfill |
+| ibm14 | 1.404858 | 58.64s | backfill |
+| ibm15 | 1.385061 | 50.69s | backfill |
+| ibm16 | 1.300769 | 3.32s | backfill |
+| ibm17 | 1.435642 | 82.01s | primary |
+| ibm18 | 1.583700 | 53.04s | backfill |

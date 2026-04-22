@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
 from pathlib import Path
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
 
 _HERE = Path(__file__).resolve().parent
-_SA_GPU = _HERE.parent / "sa_gpu"
-if str(_SA_GPU) not in sys.path:
-    sys.path.insert(0, str(_SA_GPU))
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 from benchmark_context import build_benchmark_context, load_plc_for_benchmark  # noqa: E402
 from legalize import clamp_placement, legalize_initial, legalize_placement  # noqa: E402
@@ -50,6 +53,7 @@ class DreamPlaceConfig:
     official_refine_macro_limit: int = 1000
     official_refine_rounds: int = 1
     official_refine_prefilter_chunk: int = 64
+    official_refine_full_prefilter_factor: int = 0
     official_refine_step_scales: tuple[float, ...] = (0.25, 0.5, 1.0)
     analytical_snapshot_interval: int = 20
     analytical_snapshots_per_recipe: int = 3
@@ -59,13 +63,178 @@ class DreamPlaceConfig:
     soft_relax_start_k: int = 1
     soft_relax_snapshot_interval: int = 20
     soft_relax_snapshots: int = 8
+    soft_relax_official_eval_limit: int = 4
     adaptive_large_budget: bool = True
     log_proxy_calibration: bool = False
+    resource_mode: str = "balanced"
+    official_final_only: bool = False
     recipes: tuple[tuple[float, float, float, float], ...] = (
         (0.12, 0.018, 0.030, 0.78),
         (0.18, 0.025, 0.035, 0.82),
         (0.28, 0.035, 0.030, 0.88),
     )
+
+
+class PauseRequested(RuntimeError):
+    def __init__(self, checkpoint_path: str):
+        super().__init__(f"pause requested; checkpoint saved to {checkpoint_path}")
+        self.checkpoint_path = checkpoint_path
+
+
+class _StageProfiler:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.enabled = os.getenv("DP_PROFILE_STAGES", "1") != "0"
+        self.data: dict[str, float] = {}
+        self._start = time.perf_counter()
+        self.heartbeat = _StageHeartbeat.from_env()
+
+    def stage(self, name: str):
+        return _StageScope(self, name)
+
+    def _sync(self) -> None:
+        if self.enabled and self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def add(self, name: str, seconds: float) -> None:
+        if self.enabled:
+            self.data[name] = self.data.get(name, 0.0) + float(seconds)
+
+    def finish(self) -> None:
+        self.heartbeat.update(current_stage="done", optimizer_elapsed=time.perf_counter() - self._start)
+        if self.enabled:
+            self._sync()
+            self.data["optimizer_total"] = time.perf_counter() - self._start
+
+
+class _StageHeartbeat:
+    def __init__(self, path: Path | None):
+        self.path = path
+
+    @classmethod
+    def from_env(cls) -> "_StageHeartbeat":
+        text = os.getenv("DP_STAGE_HEARTBEAT_PATH")
+        return cls(Path(text) if text else None)
+
+    def update(self, **fields) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+        }
+        if self.path.exists():
+            try:
+                payload.update(json.loads(self.path.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        payload.update(fields)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _cpuize(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _cpuize(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_cpuize(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_cpuize(v) for v in value)
+    return value
+
+
+class _CheckpointManager:
+    def __init__(self, benchmark, config: DreamPlaceConfig, heartbeat: _StageHeartbeat):
+        path_text = os.getenv("DP_CHECKPOINT_PATH")
+        self.path = Path(path_text) if path_text else None
+        pause_text = os.getenv("DP_PAUSE_REQUEST_PATH")
+        self.pause_path = Path(pause_text) if pause_text else None
+        self.benchmark_name = str(benchmark.name)
+        self.config_fingerprint = self._config_fingerprint(config)
+        self.heartbeat = heartbeat
+
+    def _config_fingerprint(self, config: DreamPlaceConfig) -> str:
+        payload = json.dumps(_jsonable(asdict(config)), sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def load(self) -> dict | None:
+        if self.path is None or not self.path.exists():
+            return None
+        try:
+            state = torch.load(self.path, map_location="cpu")
+        except Exception:
+            return None
+        if state.get("benchmark") != self.benchmark_name:
+            return None
+        if state.get("config_fingerprint") != self.config_fingerprint:
+            return None
+        return state
+
+    def save(self, stage: str, **payload) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "benchmark": self.benchmark_name,
+            "config_fingerprint": self.config_fingerprint,
+            "stage": stage,
+            "saved_at": time.time(),
+            "payload": _cpuize(payload),
+        }
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        torch.save(state, tmp_path)
+        tmp_path.replace(self.path)
+        self.heartbeat.update(checkpoint_stage=stage, checkpoint_path=str(self.path))
+
+    def pause_requested(self) -> bool:
+        return self.pause_path is not None and self.pause_path.exists()
+
+    def checkpoint_and_maybe_pause(self, stage: str, **payload) -> None:
+        self.save(stage, **payload)
+        if self.pause_requested() and self.path is not None:
+            self.clear_pause_request()
+            self.heartbeat.update(current_stage="paused", checkpoint_stage=stage, checkpoint_path=str(self.path))
+            raise PauseRequested(str(self.path))
+
+    def clear_pause_request(self) -> None:
+        if self.pause_path is not None and self.pause_path.exists():
+            self.pause_path.unlink()
+
+    def cleanup(self) -> None:
+        self.clear_pause_request()
+        if self.path is not None and self.path.exists():
+            self.path.unlink()
+
+
+class _StageScope:
+    def __init__(self, profiler: _StageProfiler, name: str):
+        self.profiler = profiler
+        self.name = name
+        self.start = 0.0
+
+    def __enter__(self):
+        self.profiler.heartbeat.update(current_stage=self.name, stage_started_at=time.time())
+        if self.profiler.enabled:
+            self.profiler._sync()
+            self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.profiler.enabled:
+            self.profiler._sync()
+            self.profiler.add(self.name, time.perf_counter() - self.start)
+        self.profiler.heartbeat.update(last_stage=self.name, current_stage="idle")
+        return False
 
 
 class DreamPlaceHybridOptimizer:
@@ -74,57 +243,107 @@ class DreamPlaceHybridOptimizer:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
+        self.last_profile: dict[str, float] = {}
+
+    def _throughput_mode(self) -> bool:
+        return self.config.resource_mode == "throughput"
+
+    def _internal_official_enabled(self) -> bool:
+        return not self.config.official_final_only
 
     def optimize(self, benchmark) -> torch.Tensor:
+        profile = _StageProfiler(self.device)
+        self.last_profile = profile.data
         trace = PlacementTraceRecorder.from_env("dreamplace_gpu", benchmark)
-        ctx = build_benchmark_context(benchmark, self.device)
-        analytical = DreamPlaceAnalyticalOptimizer(self.config, self.device, ctx)
-        candidates = analytical.generate_candidates(benchmark, trace=trace)
+        checkpoint = _CheckpointManager(benchmark, self.config, profile.heartbeat)
+        resume = checkpoint.load() or {}
+        resume_stage = str(resume.get("stage", ""))
+        payload = resume.get("payload", {})
+        with profile.stage("build_context"):
+            ctx = build_benchmark_context(benchmark, self.device)
+        if resume_stage == "analytical_done":
+            candidates = list(payload.get("candidates", []))
+        elif resume_stage in {"starts_ready", "search_done"}:
+            candidates = []
+        else:
+            with profile.stage("analytical"):
+                analytical = DreamPlaceAnalyticalOptimizer(self.config, self.device, ctx)
+                candidates = analytical.generate_candidates(benchmark, trace=trace)
+            checkpoint.checkpoint_and_maybe_pause("analytical_done", candidates=candidates)
 
-        legalized = [self._repair_candidate(pos.cpu(), benchmark) for pos in candidates]
-        legalized.append(self._repair_candidate(benchmark.macro_positions, benchmark))
-        legalized = self._unique_candidates(legalized)
+        if resume_stage in {"starts_ready", "search_done"}:
+            starts = list(payload.get("starts", []))
+        else:
+            with profile.stage("legalize_candidates"):
+                if self._throughput_mode():
+                    legalized = [clamp_placement(pos.detach().cpu(), benchmark) for pos in candidates]
+                    legalized.append(self._repair_candidate(benchmark.macro_positions, benchmark))
+                else:
+                    legalized = [self._repair_candidate(pos.cpu(), benchmark) for pos in candidates]
+                    legalized.append(self._repair_candidate(benchmark.macro_positions, benchmark))
+                legalized = self._unique_candidates(legalized)
 
-        ranked = self._rank_official(legalized, benchmark, ctx)
-        starts = [pos for _, pos in ranked[: max(1, min(self.config.top_k_candidates, len(ranked)))]]
-        if trace is not None and starts:
-            trace.record(starts[0], "legalized_best")
-        if starts and self.config.log_proxy_calibration:
-            self._log_proxy_calibration(starts[0], benchmark, ctx)
-        local = self._local_refine_best(starts, benchmark, ctx) if self.config.local_refine_trials > 0 else []
-        if local:
-            reranked = self._rank_official(starts + local, benchmark, ctx)
-            starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
+            with profile.stage("rank_initial_torch" if not self._internal_official_enabled() else "rank_initial_official"):
+                ranked = self._rank_candidates(legalized, benchmark, ctx)
+            starts = [pos for _, pos in ranked[: max(1, min(self.config.top_k_candidates, len(ranked)))]]
+            if trace is not None and starts:
+                trace.record(starts[0], "legalized_best")
+            if starts and self.config.log_proxy_calibration:
+                self._log_proxy_calibration(starts[0], benchmark, ctx)
+            with profile.stage("local_refine"):
+                local = self._local_refine_best(starts, benchmark, ctx) if self.config.local_refine_trials > 0 else []
+            if local:
+                with profile.stage("rank_local_torch" if not self._internal_official_enabled() else "rank_local_official"):
+                    reranked = self._rank_candidates(starts + local, benchmark, ctx)
+                starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
+            checkpoint.checkpoint_and_maybe_pause("starts_ready", starts=starts)
         soft_relaxed = []
-        if starts and self.config.soft_relax_iters > 0:
-            for start_pos in starts[: max(1, min(int(self.config.soft_relax_start_k), len(starts)))]:
-                soft_relaxed.extend(self._soft_relax_candidates(start_pos, benchmark, ctx))
-        if soft_relaxed:
-            reranked = self._rank_official(starts + soft_relaxed, benchmark, ctx)
-            starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
-        official_local = self._official_refine_best(starts[0], benchmark, ctx) if starts and self.config.official_refine_evals > 0 else None
-        if official_local is not None:
-            reranked = self._rank_official(starts + [official_local], benchmark, ctx)
-            starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
+        if resume_stage == "search_done":
+            starts = list(payload.get("starts", starts))
+        elif starts and self.config.soft_relax_iters > 0:
+            with profile.stage("soft_relax"):
+                for start_pos in starts[: max(1, min(int(self.config.soft_relax_start_k), len(starts)))]:
+                    soft_relaxed.extend(self._soft_relax_candidates(start_pos, benchmark, ctx))
+            if soft_relaxed:
+                with profile.stage("rank_soft_torch" if not self._internal_official_enabled() else "rank_soft_official"):
+                    reranked = self._rank_candidates(starts + soft_relaxed, benchmark, ctx)
+                starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
+            official_local = None
+            if self._internal_official_enabled():
+                with profile.stage("official_refine"):
+                    official_local = self._official_refine_best(starts[0], benchmark, ctx) if starts and self.config.official_refine_evals > 0 else None
+            if official_local is not None:
+                with profile.stage("rank_refine_official"):
+                    reranked = self._rank_candidates(starts + [official_local], benchmark, ctx)
+                starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
+            checkpoint.checkpoint_and_maybe_pause("search_done", starts=starts)
         if not self.config.run_refine or self.config.refine_iters <= 0:
             result = starts[0].cpu()
             if trace is not None:
-                trace.record(result, "final")
-                trace.close()
+                with profile.stage("trace_close"):
+                    trace.record(result, "final")
+                    trace.close()
+            profile.finish()
+            checkpoint.cleanup()
             return result
 
-        refiner = AnalyticalSARefiner(self.config, self.device, ctx)
-        refined = refiner.refine(benchmark, starts)
+        with profile.stage("sa_refine"):
+            refiner = AnalyticalSARefiner(self.config, self.device, ctx)
+            refined = refiner.refine(benchmark, starts)
         all_final = starts + refined
-        ranked_final = self._rank_official(all_final, benchmark, ctx)
+        with profile.stage("rank_final_torch" if not self._internal_official_enabled() else "rank_final_official"):
+            ranked_final = self._rank_candidates(all_final, benchmark, ctx)
         result = ranked_final[0][1].cpu()
         if trace is not None:
-            trace.record(result, "final")
-            trace.close()
+            with profile.stage("trace_close"):
+                trace.record(result, "final")
+                trace.close()
+        profile.finish()
+        checkpoint.cleanup()
         return result
 
     def _local_refine_best(self, candidates: list[torch.Tensor], benchmark, ctx) -> list[torch.Tensor]:
-        ranked = self._rank_official(candidates, benchmark, ctx)
+        ranked = self._rank_candidates(candidates, benchmark, ctx)
         if not ranked:
             return []
         evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
@@ -192,13 +411,26 @@ class DreamPlaceHybridOptimizer:
     def _soft_relax_candidates(self, start: torch.Tensor, benchmark, ctx) -> list[torch.Tensor]:
         if int(benchmark.num_soft_macros) <= 0:
             return []
+        if self.config.adaptive_large_budget and int(benchmark.num_hard_macros) >= 580 and not self._throughput_mode():
+            return []
         plc = self._plc_for_benchmark(benchmark, ctx)
-        if plc is None:
-            return []
-        baseline = compute_proxy_cost(start, benchmark, plc)
-        if int(baseline["overlap_count"]) != 0:
-            return []
-        best_score = float(baseline["proxy_cost"])
+        evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
+        if self._throughput_mode() or not self._internal_official_enabled():
+            baseline_cost = evaluator.evaluate_batch(start.to(self.device, dtype=torch.float32))
+            if not bool(baseline_cost.is_legal.item()):
+                return []
+            best_score = float(baseline_cost.official_proxy.item())
+            baseline = {
+                "proxy_cost": best_score,
+                "congestion_cost": float(baseline_cost.congestion_cost.item()),
+            }
+        else:
+            if plc is None:
+                return []
+            baseline = compute_proxy_cost(start, benchmark, plc)
+            if int(baseline["overlap_count"]) != 0:
+                return []
+            best_score = float(baseline["proxy_cost"])
         out: list[torch.Tensor] = []
         route_weight = self._soft_relax_route_weight(benchmark, baseline)
         scales = self._soft_relax_lr_scales(benchmark, baseline)
@@ -270,7 +502,7 @@ class DreamPlaceHybridOptimizer:
                     snapshots.append((loss_value, x.detach().cpu().clone()))
 
         snapshots.sort(key=lambda item: item[0])
-        out: list[torch.Tensor] = []
+        candidates: list[torch.Tensor] = []
         seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
         snapshot_limit = self._large_case_soft_snapshot_limit(benchmark)
         for _, cand in snapshots[: max(1, int(snapshot_limit))]:
@@ -279,15 +511,74 @@ class DreamPlaceHybridOptimizer:
             if key in seen:
                 continue
             seen.add(key)
+            candidates.append(cand)
+
+        if self._throughput_mode() or not self._internal_official_enabled():
+            return [candidates[idx] for idx in self._soft_relax_torch_order(candidates, ctx, best_score, benchmark)]
+
+        out: list[torch.Tensor] = []
+        official_order = self._soft_relax_official_order(candidates, benchmark, ctx)
+        for idx in official_order:
+            cand = candidates[idx]
             official = compute_proxy_cost(cand, benchmark, plc)
             if int(official["overlap_count"]) == 0 and float(official["proxy_cost"]) < best_score:
                 print(f"[dreamplace_gpu] soft_relax lr={lr_scale:.6g} proxy={float(official['proxy_cost']):.6f}")
                 out.append(cand)
         return out
 
+    def _soft_relax_torch_order(
+        self,
+        candidates: list[torch.Tensor],
+        ctx,
+        best_score: float,
+        benchmark,
+    ) -> list[int]:
+        if not candidates:
+            return []
+        limit = min(len(candidates), max(self._large_case_soft_snapshot_limit(benchmark), 1))
+        evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
+        stacked = torch.stack([cand.to(self.device, dtype=torch.float32) for cand in candidates])
+        with torch.no_grad():
+            costs = evaluator.evaluate_batch(stacked)
+            score = torch.where(
+                costs.is_legal & (costs.official_proxy < best_score),
+                costs.official_proxy,
+                torch.full_like(costs.official_proxy, torch.inf),
+            )
+            k = min(max(limit, 1), int(score.numel()))
+            top_score, order = torch.topk(score, k=k, largest=False)
+        return [
+            int(idx)
+            for value, idx in zip(top_score.detach().cpu().tolist(), order.detach().cpu().tolist())
+            if value != float("inf")
+        ]
+
+    def _soft_relax_official_order(self, candidates: list[torch.Tensor], benchmark, ctx) -> list[int]:
+        if not candidates:
+            return []
+        limit = min(len(candidates), self._large_case_soft_official_eval_limit(benchmark))
+        if limit <= 0:
+            return []
+        if len(candidates) <= limit:
+            return list(range(len(candidates)))
+        evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
+        stacked = torch.stack([cand.to(self.device, dtype=torch.float32) for cand in candidates])
+        with torch.no_grad():
+            costs = evaluator.evaluate_batch(stacked)
+            score = torch.where(
+                costs.is_legal,
+                costs.search_score,
+                torch.full_like(costs.search_score, torch.inf),
+            )
+            k = min(max(limit, 1), int(score.numel()))
+            _, order = torch.topk(score, k=k, largest=False)
+        return [int(idx) for idx in order.detach().cpu().tolist() if float(score[int(idx)].detach().cpu()) != float("inf")]
+
     def _soft_relax_lr_scales(self, benchmark, baseline: dict) -> tuple[float, ...]:
         scales = self.config.soft_relax_lr_scales or (float(self.config.soft_relax_lr_scale),)
         if not self.config.adaptive_large_budget:
+            return scales
+        if self._throughput_mode():
             return scales
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
@@ -311,6 +602,8 @@ class DreamPlaceHybridOptimizer:
         iters = max(int(self.config.soft_relax_iters), 0)
         if not self.config.adaptive_large_budget:
             return iters
+        if self._throughput_mode():
+            return iters
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n <= 260 and total <= 1200:
@@ -329,25 +622,47 @@ class DreamPlaceHybridOptimizer:
         limit = max(int(self.config.soft_relax_snapshots), 1)
         if not self.config.adaptive_large_budget:
             return limit
+        if self._throughput_mode():
+            return limit
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n >= 700:
             return min(limit, 1)
         if n >= 580:
-            return min(limit, 2)
+            return min(limit, 1)
         if n >= 380:
             if total <= 1600:
                 return min(limit, 4)
             return min(limit, 2)
         return limit
 
+    def _large_case_soft_official_eval_limit(self, benchmark) -> int:
+        limit = max(int(self.config.soft_relax_official_eval_limit), 0)
+        if not self.config.adaptive_large_budget:
+            return limit
+        if self._throughput_mode():
+            return limit
+        n = int(benchmark.num_hard_macros)
+        total = int(benchmark.num_macros)
+        if n >= 580:
+            return 0
+        if n >= 380:
+            return min(limit, 1)
+        if total >= 1200:
+            return min(limit, 1)
+        return limit
+
     def _large_case_official_refine_budget(self, benchmark) -> int:
         budget = max(int(self.config.official_refine_evals), 0)
         if not self.config.adaptive_large_budget:
             return budget
+        if self._throughput_mode():
+            return budget
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n >= 700:
+            return 0
+        if total >= 1200:
             return 0
         if n >= 580:
             return min(budget, 8)
@@ -361,6 +676,8 @@ class DreamPlaceHybridOptimizer:
         limit = max(1, int(self.config.official_refine_macro_limit))
         if not self.config.adaptive_large_budget:
             return limit
+        if self._throughput_mode():
+            return limit
         n = int(benchmark.num_hard_macros)
         if n >= 700:
             return min(limit, 192)
@@ -369,17 +686,27 @@ class DreamPlaceHybridOptimizer:
         return limit
 
     def _official_refine_best(self, start: torch.Tensor, benchmark, ctx) -> torch.Tensor | None:
+        if not self._internal_official_enabled():
+            return None
+        official_budget = self._large_case_official_refine_budget(benchmark)
+        if official_budget <= 0:
+            return None
+        throughput = self._throughput_mode()
         plc = self._plc_for_benchmark(benchmark, ctx)
-        if plc is None:
+        if plc is None and not throughput:
             return None
-
         best = start.detach().cpu()
-        best_costs = compute_proxy_cost(best, benchmark, plc)
-        if int(best_costs["overlap_count"]) != 0:
-            return None
-        best_score = float(best_costs["proxy_cost"])
-
         evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
+        if throughput:
+            best_costs = evaluator.evaluate_batch(best.to(self.device, dtype=torch.float32))
+            if not bool(best_costs.is_legal.item()):
+                return None
+            best_score = float(best_costs.official_proxy.item())
+        else:
+            best_costs = compute_proxy_cost(best, benchmark, plc)
+            if int(best_costs["overlap_count"]) != 0:
+                return None
+            best_score = float(best_costs["proxy_cost"])
         sizes = benchmark.macro_sizes
         movable = torch.where(benchmark.get_movable_mask() & benchmark.get_hard_macro_mask())[0].tolist()
         if not movable:
@@ -404,7 +731,6 @@ class DreamPlaceHybridOptimizer:
         )
         improved = False
         rounds = max(1, int(self.config.official_refine_rounds))
-        official_budget = self._large_case_official_refine_budget(benchmark)
 
         best_device = best.to(self.device, dtype=torch.float32)
 
@@ -412,8 +738,10 @@ class DreamPlaceHybridOptimizer:
             if official_budget <= 0:
                 break
             keep = official_budget
-            scored: list[tuple[float, tuple[int, float, float, float]]] = []
-            chunk_size = max(1, int(self.config.official_refine_prefilter_chunk))
+            use_cheap_prefilter = int(self.config.official_refine_full_prefilter_factor) > 0
+            cheap_scored: list[tuple[float, tuple[int, float, float, float]]] = []
+            all_specs: list[tuple[int, float, float, float]] = []
+            chunk_size = self._official_refine_chunk_size(benchmark)
             specs: list[tuple[int, float, float, float]] = []
             with torch.no_grad():
                 for scale in self.config.official_refine_step_scales:
@@ -423,28 +751,33 @@ class DreamPlaceHybridOptimizer:
                             specs.append((macro_idx, step, float(dx), float(dy)))
                             if len(specs) < chunk_size:
                                 continue
-                            stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
-                            costs = evaluator.evaluate_batch(stacked)
-                            search_score = torch.where(
-                                costs.is_legal,
-                                costs.search_score,
-                                torch.full_like(costs.search_score, torch.inf),
-                            )
-                            for offset, score in enumerate(search_score.detach().cpu().tolist()):
-                                if score != float("inf"):
-                                    scored.append((float(score), specs[offset]))
+                            if use_cheap_prefilter:
+                                stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
+                                search_score = self._official_refine_cheap_scores(stacked, specs, benchmark, evaluator)
+                                for offset, score in enumerate(search_score.detach().cpu().tolist()):
+                                    if score != float("inf"):
+                                        cheap_scored.append((float(score), specs[offset]))
+                            else:
+                                all_specs.extend(specs)
                             specs = []
                 if specs:
-                    stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
-                    costs = evaluator.evaluate_batch(stacked)
-                    search_score = torch.where(
-                        costs.is_legal,
-                        costs.search_score,
-                        torch.full_like(costs.search_score, torch.inf),
-                    )
-                    for offset, score in enumerate(search_score.detach().cpu().tolist()):
-                        if score != float("inf"):
-                            scored.append((float(score), specs[offset]))
+                    if use_cheap_prefilter:
+                        stacked = self._build_official_refine_chunk(best_device, specs, sizes, benchmark)
+                        search_score = self._official_refine_cheap_scores(stacked, specs, benchmark, evaluator)
+                        for offset, score in enumerate(search_score.detach().cpu().tolist()):
+                            if score != float("inf"):
+                                cheap_scored.append((float(score), specs[offset]))
+                    else:
+                        all_specs.extend(specs)
+            if use_cheap_prefilter:
+                if not cheap_scored:
+                    break
+                cheap_scored.sort(key=lambda item: item[0])
+                full_limit = max(keep, keep * max(1, int(self.config.official_refine_full_prefilter_factor)))
+                full_specs = [spec for _, spec in cheap_scored[: min(full_limit, len(cheap_scored))]]
+            else:
+                full_specs = all_specs
+            scored = self._score_official_refine_full(best_device, full_specs, sizes, benchmark, evaluator, keep)
             if not scored:
                 break
             scored.sort(key=lambda item: item[0])
@@ -452,18 +785,26 @@ class DreamPlaceHybridOptimizer:
 
             round_best = best
             round_best_score = best_score
-            for spec in order:
-                cand = self._materialize_official_refine_candidate(best, spec, benchmark)
-                official = compute_proxy_cost(cand, benchmark, plc)
-                official_budget -= 1
-                if int(official["overlap_count"]) != 0:
-                    continue
-                score = float(official["proxy_cost"])
-                if score < round_best_score:
-                    round_best = cand
-                    round_best_score = score
-                if official_budget <= 0:
-                    break
+            if throughput:
+                for score, spec in scored[:keep]:
+                    if score < round_best_score:
+                        round_best = self._materialize_official_refine_candidate(best, spec, benchmark)
+                        round_best_score = float(score)
+                        break
+                official_budget = 0
+            else:
+                for spec in order:
+                    cand = self._materialize_official_refine_candidate(best, spec, benchmark)
+                    official = compute_proxy_cost(cand, benchmark, plc)
+                    official_budget -= 1
+                    if int(official["overlap_count"]) != 0:
+                        continue
+                    score = float(official["proxy_cost"])
+                    if score < round_best_score:
+                        round_best = cand
+                        round_best_score = score
+                    if official_budget <= 0:
+                        break
             if round_best_score < best_score:
                 best = round_best
                 best_device = best.to(self.device, dtype=torch.float32)
@@ -476,6 +817,65 @@ class DreamPlaceHybridOptimizer:
             print(f"[dreamplace_gpu] official_refine proxy={best_score:.6f}")
             return best
         return None
+
+    def _official_refine_cheap_scores(
+        self,
+        candidates: torch.Tensor,
+        specs: list[tuple[int, float, float, float]],
+        benchmark,
+        evaluator: TorchProxyCostEvaluator,
+    ) -> torch.Tensor:
+        overlap_legal = self._official_refine_overlap_legal(candidates, specs, benchmark)
+        wirelength = evaluator._wirelength(candidates)
+        boundary = evaluator._boundary_violation(candidates)
+        fixed = evaluator._fixed_violation(candidates)
+        legal = overlap_legal & (boundary <= evaluator.gap) & (fixed <= evaluator.gap)
+        score = wirelength + evaluator.boundary_weight * (boundary + fixed)
+        return torch.where(legal, score, torch.full_like(score, torch.inf))
+
+    def _score_official_refine_full(
+        self,
+        base: torch.Tensor,
+        specs: list[tuple[int, float, float, float]],
+        sizes: torch.Tensor,
+        benchmark,
+        evaluator: TorchProxyCostEvaluator,
+        keep_per_chunk: int,
+    ) -> list[tuple[float, tuple[int, float, float, float]]]:
+        out: list[tuple[float, tuple[int, float, float, float]]] = []
+        chunk_size = self._official_refine_chunk_size(benchmark)
+        with torch.no_grad():
+            for start in range(0, len(specs), chunk_size):
+                chunk_specs = specs[start : start + chunk_size]
+                stacked = self._build_official_refine_chunk(base, chunk_specs, sizes, benchmark)
+                overlap_legal = self._official_refine_overlap_legal(stacked, chunk_specs, benchmark)
+                costs = evaluator.evaluate_batch(stacked, check_overlap=False)
+                legal = costs.is_legal & overlap_legal
+                search_score = torch.where(
+                    legal,
+                    costs.search_score,
+                    torch.full_like(costs.search_score, torch.inf),
+                )
+                k = min(max(int(keep_per_chunk), 1), int(search_score.numel()))
+                top_score, top_idx = torch.topk(search_score, k=k, largest=False)
+                for score, offset in zip(top_score.detach().cpu().tolist(), top_idx.detach().cpu().tolist()):
+                    if score != float("inf"):
+                        out.append((float(score), chunk_specs[int(offset)]))
+        return out
+
+    def _official_refine_chunk_size(self, benchmark) -> int:
+        chunk_size = max(1, int(self.config.official_refine_prefilter_chunk))
+        if not self._throughput_mode():
+            return chunk_size
+        n = int(benchmark.num_hard_macros)
+        total = int(benchmark.num_macros)
+        if n >= 700:
+            return min(chunk_size, 64)
+        if n >= 580 or total >= 1800:
+            return min(chunk_size, 128)
+        if n >= 380 or total >= 1200:
+            return min(chunk_size, 256)
+        return chunk_size
 
     def _build_official_refine_chunk(
         self,
@@ -498,6 +898,37 @@ class DreamPlaceHybridOptimizer:
         stacked[:, :, 1].clamp_(sizes[:, 1] / 2, float(benchmark.canvas_height) - sizes[:, 1] / 2)
         return stacked
 
+    def _official_refine_overlap_legal(
+        self,
+        candidates: torch.Tensor,
+        specs: list[tuple[int, float, float, float]],
+        benchmark,
+    ) -> torch.Tensor:
+        n = int(benchmark.num_hard_macros)
+        if n <= 1:
+            return torch.ones(candidates.shape[0], dtype=torch.bool, device=self.device)
+        moved = torch.tensor([item[0] for item in specs], dtype=torch.long, device=self.device)
+        rows = torch.arange(len(specs), dtype=torch.long, device=self.device)
+        pos = candidates[:, :n, :]
+        sizes = benchmark.macro_sizes[:n].to(self.device, dtype=torch.float32)
+
+        moved_pos = pos[rows, moved]
+        moved_size = sizes[moved]
+        moved_left = moved_pos[:, 0] - moved_size[:, 0] / 2
+        moved_right = moved_pos[:, 0] + moved_size[:, 0] / 2
+        moved_bottom = moved_pos[:, 1] - moved_size[:, 1] / 2
+        moved_top = moved_pos[:, 1] + moved_size[:, 1] / 2
+
+        left = pos[:, :, 0] - sizes[:, 0].view(1, n) / 2
+        right = pos[:, :, 0] + sizes[:, 0].view(1, n) / 2
+        bottom = pos[:, :, 1] - sizes[:, 1].view(1, n) / 2
+        top = pos[:, :, 1] + sizes[:, 1].view(1, n) / 2
+        ox = (torch.minimum(moved_right.view(-1, 1), right) - torch.maximum(moved_left.view(-1, 1), left)).clamp_min(0)
+        oy = (torch.minimum(moved_top.view(-1, 1), top) - torch.maximum(moved_bottom.view(-1, 1), bottom)).clamp_min(0)
+        area = ox * oy
+        self_mask = torch.arange(n, device=self.device).view(1, n) == moved.view(-1, 1)
+        return ~((area > 1.0e-4) & ~self_mask).any(dim=1)
+
     def _materialize_official_refine_candidate(
         self,
         base: torch.Tensor,
@@ -510,13 +941,25 @@ class DreamPlaceHybridOptimizer:
         cand[macro_idx, 1] += dy * step
         return clamp_placement(cand, benchmark)
 
+    def _rank_candidates(self, candidates: list[torch.Tensor], benchmark, ctx=None) -> list[tuple[float, torch.Tensor]]:
+        if not self._internal_official_enabled():
+            evaluator_ctx = ctx if ctx is not None else build_benchmark_context(benchmark, self.device)
+            evaluator = TorchProxyCostEvaluator(evaluator_ctx)
+            torch_scores = self._score_torch_candidates(candidates, evaluator)
+            rows = [(torch_scores[i], candidates[i]) for i in range(len(candidates))]
+            return sorted(rows, key=lambda item: item[0])
+        return self._rank_official(candidates, benchmark, ctx)
+
     def _rank_official(self, candidates: list[torch.Tensor], benchmark, ctx=None) -> list[tuple[float, torch.Tensor]]:
         plc = self._plc_for_benchmark(benchmark, ctx) if ctx is not None else load_plc_for_benchmark(benchmark.name)
         evaluator_ctx = ctx if ctx is not None else build_benchmark_context(benchmark, self.device)
         candidate_order = list(range(len(candidates)))
-        limit = int(self.config.official_rerank_limit)
+        limit = self._official_rerank_limit(benchmark)
         if limit <= 0:
-            limit = max(1, int(self.config.top_k_candidates) * 2)
+            evaluator = TorchProxyCostEvaluator(evaluator_ctx)
+            torch_scores = self._score_torch_candidates(candidates, evaluator)
+            rows = [(torch_scores[i], candidates[i]) for i in range(len(candidates))]
+            return sorted(rows, key=lambda item: item[0])
         if len(candidates) > limit:
             evaluator = TorchProxyCostEvaluator(evaluator_ctx)
             torch_scores = self._score_torch_candidates(candidates, evaluator)
@@ -541,6 +984,23 @@ class DreamPlaceHybridOptimizer:
             score = float(costs["proxy_cost"]) if int(costs["overlap_count"]) == 0 else float("inf")
             rows[idx] = (score, pos)
         return sorted(rows, key=lambda item: item[0])
+
+    def _official_rerank_limit(self, benchmark) -> int:
+        limit = int(self.config.official_rerank_limit)
+        if limit > 0:
+            return max(1, limit)
+        limit = max(1, int(self.config.top_k_candidates) * 2)
+        if not self.config.adaptive_large_budget:
+            return limit
+        if self._throughput_mode() and (int(benchmark.num_hard_macros) >= 380 or int(benchmark.num_macros) >= 1200):
+            return 0
+        n = int(benchmark.num_hard_macros)
+        total = int(benchmark.num_macros)
+        if n >= 580:
+            return 0
+        if n >= 380 or total >= 1200:
+            return min(limit, 1)
+        return limit
 
     def _score_torch_candidates(
         self,
@@ -606,6 +1066,7 @@ class DreamPlaceAnalyticalOptimizer:
         self.config = config
         self.device = device
         self.ctx = ctx
+        self._grid_box_cache: dict[tuple[float, float, int, int, torch.dtype], torch.Tensor] = {}
 
     def generate_candidates(self, benchmark, trace: PlacementTraceRecorder | None = None) -> list[torch.Tensor]:
         base = clamp_placement(legalize_initial(benchmark), benchmark).to(self.device, dtype=torch.float32)
@@ -1072,13 +1533,19 @@ class DreamPlaceAnalyticalOptimizer:
         return out
 
     def _grid_boxes(self, benchmark, rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
+        key = (float(benchmark.canvas_width), float(benchmark.canvas_height), int(rows), int(cols), dtype)
+        cached = self._grid_box_cache.get(key)
+        if cached is not None:
+            return cached
         xs = torch.linspace(0, float(benchmark.canvas_width), cols + 1, device=self.device, dtype=dtype)
         ys = torch.linspace(0, float(benchmark.canvas_height), rows + 1, device=self.device, dtype=dtype)
-        boxes = []
-        for r in range(rows):
-            for c in range(cols):
-                boxes.append(torch.stack([xs[c], ys[r], xs[c + 1], ys[r + 1]]))
-        return torch.stack(boxes, dim=0)
+        x0 = xs[:-1].view(1, cols).expand(rows, cols)
+        x1 = xs[1:].view(1, cols).expand(rows, cols)
+        y0 = ys[:-1].view(rows, 1).expand(rows, cols)
+        y1 = ys[1:].view(rows, 1).expand(rows, cols)
+        boxes = torch.stack((x0, y0, x1, y1), dim=2).reshape(rows * cols, 4)
+        self._grid_box_cache[key] = boxes
+        return boxes
 
     def _bin_grid_shape(self, benchmark) -> tuple[int, int]:
         rows = max(1, min(int(benchmark.grid_rows), int(self.config.bin_grid_cap)))

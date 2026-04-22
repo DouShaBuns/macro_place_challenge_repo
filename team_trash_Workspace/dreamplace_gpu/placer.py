@@ -7,10 +7,8 @@ from pathlib import Path
 import torch
 
 _HERE = Path(__file__).resolve().parent
-_SA_GPU = _HERE.parent / "sa_gpu"
-for path in (_HERE, _SA_GPU):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 from optimizer import DreamPlaceConfig, DreamPlaceHybridOptimizer  # noqa: E402
 
@@ -73,6 +71,7 @@ class DreamPlaceGPUPlacer:
             official_refine_macro_limit=int(os.getenv("DP_OFFICIAL_REFINE_MACRO_LIMIT", "1000")),
             official_refine_rounds=int(os.getenv("DP_OFFICIAL_REFINE_ROUNDS", "1")),
             official_refine_prefilter_chunk=int(os.getenv("DP_OFFICIAL_REFINE_PREFILTER_CHUNK", "64")),
+            official_refine_full_prefilter_factor=int(os.getenv("DP_OFFICIAL_REFINE_FULL_PREFILTER_FACTOR", "0")),
             official_refine_step_scales=_parse_float_tuple(
                 os.getenv("DP_OFFICIAL_REFINE_STEP_SCALES"),
                 (0.25, 0.5, 1.0),
@@ -88,12 +87,18 @@ class DreamPlaceGPUPlacer:
             soft_relax_start_k=int(os.getenv("DP_SOFT_RELAX_START_K", "1")),
             soft_relax_snapshot_interval=int(os.getenv("DP_SOFT_RELAX_SNAPSHOT_INTERVAL", "20")),
             soft_relax_snapshots=int(os.getenv("DP_SOFT_RELAX_SNAPSHOTS", "8")),
+            soft_relax_official_eval_limit=int(os.getenv("DP_SOFT_RELAX_OFFICIAL_EVAL_LIMIT", "4")),
             adaptive_large_budget=os.getenv("DP_ADAPTIVE_LARGE_BUDGET", "1") != "0",
             log_proxy_calibration=os.getenv("DP_LOG_PROXY_CALIBRATION", "0") != "0",
+            resource_mode=os.getenv("DP_RESOURCE_MODE", "balanced"),
+            official_final_only=os.getenv("DP_OFFICIAL_FINAL_ONLY", "0") != "0",
             **({"recipes": recipes} if recipes is not None else {}),
         )
         self.device = os.getenv("DP_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.last_profile: dict[str, float] = {}
 
     def place(self, benchmark):
         optimizer = DreamPlaceHybridOptimizer(self.config, device=self.device)
-        return optimizer.optimize(benchmark)
+        placement = optimizer.optimize(benchmark)
+        self.last_profile = dict(getattr(optimizer, "last_profile", {}))
+        return placement
