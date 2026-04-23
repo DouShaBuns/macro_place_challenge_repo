@@ -51,6 +51,7 @@ class DreamPlaceConfig:
     official_refine_rounds: int = 1
     official_refine_prefilter_chunk: int = 64
     official_refine_full_prefilter_factor: int = 0
+    official_refine_verify_top_k: int = 8
     official_refine_step_scales: tuple[float, ...] = (0.25, 0.5, 1.0)
     analytical_snapshot_interval: int = 20
     analytical_snapshots_per_recipe: int = 3
@@ -61,6 +62,7 @@ class DreamPlaceConfig:
     soft_relax_snapshot_interval: int = 20
     soft_relax_snapshots: int = 8
     soft_relax_official_eval_limit: int = 4
+    batched_soft_relax: bool = True
     adaptive_large_budget: bool = True
     log_proxy_calibration: bool = False
     resource_mode: str = "balanced"
@@ -241,6 +243,7 @@ class DreamPlaceHybridOptimizer:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.last_profile: dict[str, float] = {}
+        self._metrics: dict[str, float] = {}
 
     def _throughput_mode(self) -> bool:
         return self.config.resource_mode == "throughput"
@@ -251,6 +254,7 @@ class DreamPlaceHybridOptimizer:
     def optimize(self, benchmark) -> torch.Tensor:
         profile = _StageProfiler(self.device)
         self.last_profile = profile.data
+        self._metrics = {}
         trace = PlacementTraceRecorder.from_env("dreamplace_gpu", benchmark)
         checkpoint = _CheckpointManager(benchmark, self.config, profile.heartbeat)
         resume = checkpoint.load() or {}
@@ -320,8 +324,12 @@ class DreamPlaceHybridOptimizer:
                 trace.record(result, "final")
                 trace.close()
         profile.finish()
+        profile.data.update(self._metrics)
         checkpoint.cleanup()
         return result
+
+    def _metric_add(self, name: str, value: float = 1.0) -> None:
+        self._metrics[name] = self._metrics.get(name, 0.0) + float(value)
 
     def _local_refine_best(self, candidates: list[torch.Tensor], benchmark, ctx) -> list[torch.Tensor]:
         ranked = self._rank_candidates(candidates, benchmark, ctx)
@@ -392,12 +400,12 @@ class DreamPlaceHybridOptimizer:
     def _soft_relax_candidates(self, start: torch.Tensor, benchmark, ctx) -> list[torch.Tensor]:
         if int(benchmark.num_soft_macros) <= 0:
             return []
-        if self.config.adaptive_large_budget and int(benchmark.num_hard_macros) >= 580 and not self._throughput_mode():
-            return []
         plc = self._plc_for_benchmark(benchmark, ctx)
         evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
         if self._throughput_mode() or not self._internal_official_enabled():
             baseline_cost = evaluator.evaluate_batch(start.to(self.device, dtype=torch.float32))
+            self._metric_add("torch_eval_batches", 1)
+            self._metric_add("torch_eval_candidates", 1)
             if not bool(baseline_cost.is_legal.item()):
                 return []
             best_score = float(baseline_cost.official_proxy.item())
@@ -409,6 +417,8 @@ class DreamPlaceHybridOptimizer:
             if plc is None:
                 return []
             baseline = compute_proxy_cost(start, benchmark, plc)
+            self._metric_add("official_evals", 1)
+            self._metric_add("soft_relax_official_evals", 1)
             if int(baseline["overlap_count"]) != 0:
                 return []
             best_score = float(baseline["proxy_cost"])
@@ -416,13 +426,306 @@ class DreamPlaceHybridOptimizer:
         route_weight = self._soft_relax_route_weight(benchmark, baseline)
         scales = self._soft_relax_lr_scales(benchmark, baseline)
         seen: set[float] = set()
+        lr_scales: list[float] = []
         for lr_scale in scales:
             key = round(float(lr_scale), 12)
             if key in seen:
                 continue
             seen.add(key)
-            out.extend(self._soft_relax_one(start, benchmark, ctx, plc, best_score, float(lr_scale), route_weight))
+            lr_scales.append(float(lr_scale))
+        if self.config.batched_soft_relax and len(lr_scales) > 1:
+            out.extend(self._soft_relax_batch(start, benchmark, ctx, plc, best_score, tuple(lr_scales), route_weight))
+        else:
+            for lr_scale in lr_scales:
+                out.extend(self._soft_relax_one(start, benchmark, ctx, plc, best_score, lr_scale, route_weight))
         return out
+
+    def _soft_relax_batch(
+        self,
+        start: torch.Tensor,
+        benchmark,
+        ctx,
+        plc,
+        best_score: float,
+        lr_scales: tuple[float, ...],
+        route_weight: float,
+    ) -> list[torch.Tensor]:
+        batch = len(lr_scales)
+        if batch <= 1:
+            return self._soft_relax_one(start, benchmark, ctx, plc, best_score, float(lr_scales[0]), route_weight)
+
+        base = start.detach().to(self.device, dtype=torch.float32)
+        x = base.unsqueeze(0).repeat(batch, 1, 1).clone()
+        original_hard = x[:, : int(benchmark.num_hard_macros), :].detach().clone()
+        sizes = benchmark.macro_sizes.to(self.device, dtype=torch.float32)
+        soft_mask = torch.zeros(int(benchmark.num_macros), dtype=torch.bool, device=self.device)
+        soft_mask[int(benchmark.num_hard_macros) :] = True
+        fixed = benchmark.macro_fixed.to(self.device)
+        movable = soft_mask & ~fixed
+        if not bool(movable.any()):
+            return []
+
+        x.requires_grad_(True)
+        lr = torch.tensor(lr_scales, dtype=torch.float32, device=self.device).view(batch, 1, 1) * max(
+            float(benchmark.canvas_width),
+            float(benchmark.canvas_height),
+        )
+        m = torch.zeros_like(x)
+        v = torch.zeros_like(x)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1.0e-8
+
+        analytical = DreamPlaceAnalyticalOptimizer(self.config, self.device, ctx)
+        rows, cols = analytical._bin_grid_shape(benchmark)
+        density_grid = analytical._grid_boxes(benchmark, rows, cols, base.dtype) if rows * cols > 1 else None
+        soft_iters = self._large_case_soft_iters(benchmark)
+        best_loss = torch.full((batch,), float("inf"), dtype=torch.float32, device=self.device)
+        best_x = x.detach().clone()
+        snapshots: list[tuple[float, torch.Tensor]] = []
+        interval = max(int(self.config.soft_relax_snapshot_interval), 0)
+
+        for step in range(max(int(soft_iters), 0)):
+            if x.grad is not None:
+                x.grad = None
+            frac = step / max(float(soft_iters - 1), 1.0)
+            gamma = max(float(self.config.gamma_scale) * (1.0 - 0.5 * frac), 1.0e-3) * max(
+                float(benchmark.canvas_width),
+                float(benchmark.canvas_height),
+            )
+            wl = self._batched_weighted_average_wirelength(x, benchmark, ctx, gamma)
+            density = self._batched_density_loss(x, benchmark, sizes, rows, cols, self.config.target_density, density_grid)
+            soft_route_cong = self._batched_soft_route_congestion_loss(x, benchmark, ctx, rows, cols)
+            boundary = self._batched_boundary_loss(x, benchmark, sizes)
+            loss_vec = wl + self.config.density_weight * density + route_weight * soft_route_cong + self.config.boundary_weight * boundary
+            loss_vec.sum().backward()
+            with torch.no_grad():
+                grad = x.grad
+                if grad is None:
+                    break
+                grad *= movable.view(1, -1, 1).to(grad.dtype)
+                m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                t = step + 1
+                m_hat = m / (1.0 - beta1**t)
+                v_hat = v / (1.0 - beta2**t)
+                x -= lr * m_hat / (v_hat.sqrt() + eps)
+                x[:, : int(benchmark.num_hard_macros), :] = original_hard
+                x[:, :, 0].clamp_(sizes[:, 0].view(1, -1) / 2, float(benchmark.canvas_width) - sizes[:, 0].view(1, -1) / 2)
+                x[:, :, 1].clamp_(sizes[:, 1].view(1, -1) / 2, float(benchmark.canvas_height) - sizes[:, 1].view(1, -1) / 2)
+                loss_det = loss_vec.detach()
+                improved = loss_det < best_loss
+                best_loss = torch.where(improved, loss_det, best_loss)
+                best_x = torch.where(improved.view(batch, 1, 1), x.detach(), best_x)
+                if interval > 0 and (step % interval == 0 or step == soft_iters - 1):
+                    snap_x = x.detach().cpu()
+                    snap_loss = loss_det.detach().cpu().tolist()
+                    for idx, loss_value in enumerate(snap_loss):
+                        snapshots.append((float(loss_value), snap_x[idx].clone()))
+
+        best_x_cpu = best_x.detach().cpu()
+        for loss_value, cand in zip(best_loss.detach().cpu().tolist(), best_x_cpu):
+            if loss_value != float("inf"):
+                snapshots.append((float(loss_value), cand.clone()))
+
+        self._metric_add("soft_relax_batched_groups", 1)
+        self._metric_add("soft_relax_batched_lanes", batch)
+        snapshots.sort(key=lambda item: item[0])
+        candidates: list[torch.Tensor] = []
+        seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+        snapshot_limit = self._large_case_soft_snapshot_limit(benchmark) * batch
+        for _, cand in snapshots[: max(1, int(snapshot_limit))]:
+            rounded = torch.round(cand * 1000).to(torch.int64)
+            key = (tuple(int(v) for v in rounded[:, 0].tolist()), tuple(int(v) for v in rounded[:, 1].tolist()))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(cand)
+
+        if self._throughput_mode() or not self._internal_official_enabled():
+            return [candidates[idx] for idx in self._soft_relax_torch_order(candidates, ctx, best_score, benchmark)]
+
+        out: list[torch.Tensor] = []
+        official_order = self._soft_relax_official_order(candidates, benchmark, ctx)
+        for idx in official_order:
+            cand = candidates[idx]
+            official = compute_proxy_cost(cand, benchmark, plc)
+            self._metric_add("official_evals", 1)
+            self._metric_add("soft_relax_official_evals", 1)
+            if int(official["overlap_count"]) == 0 and float(official["proxy_cost"]) < best_score:
+                print(f"[dreamplace_gpu] soft_relax batched proxy={float(official['proxy_cost']):.6f}")
+                out.append(cand)
+        return out
+
+    def _batched_pin_positions(self, placements, parent, offset, port_pos, is_port):
+        batch = placements.shape[0]
+        if parent.numel() == 0:
+            return torch.zeros((batch, 0, 2), dtype=placements.dtype, device=self.device)
+        gathered = placements[:, parent.clamp_min(0), :] + offset.to(dtype=placements.dtype).unsqueeze(0)
+        ports = port_pos.to(dtype=placements.dtype).unsqueeze(0).expand(batch, -1, -1)
+        return torch.where(is_port.view(1, -1, 1), ports, gathered)
+
+    def _batched_weighted_average_wirelength(self, placements, benchmark, ctx, gamma: float) -> torch.Tensor:
+        batch = placements.shape[0]
+        if ctx.net_pin_parent.numel() == 0 or ctx.num_nets == 0:
+            return placements.new_zeros((batch,))
+        pin_pos = self._batched_pin_positions(
+            placements,
+            ctx.net_pin_parent,
+            ctx.net_pin_offset,
+            ctx.net_pin_port_pos,
+            ctx.net_pin_is_port,
+        )
+        net_ids = ctx.net_pin_net_id.unsqueeze(0).expand(batch, -1)
+        wx = self._batched_wa_axis(pin_pos[:, :, 0], net_ids, ctx.num_nets, gamma)
+        wy = self._batched_wa_axis(pin_pos[:, :, 1], net_ids, ctx.num_nets, gamma)
+        hpwl = wx + wy
+        denom = (float(benchmark.canvas_width) + float(benchmark.canvas_height)) * max(float(ctx.wirelength_norm_net_count), 1.0)
+        return (hpwl * ctx.net_weights.to(dtype=placements.dtype).unsqueeze(0)).sum(dim=1) / max(denom, 1.0e-9)
+
+    def _batched_wa_axis(self, coord: torch.Tensor, net_ids: torch.Tensor, num_nets: int, gamma: float) -> torch.Tensor:
+        batch = coord.shape[0]
+        scaled = coord / gamma
+        max_pos = torch.full((batch, num_nets), -torch.inf, dtype=coord.dtype, device=self.device)
+        max_neg = torch.full((batch, num_nets), -torch.inf, dtype=coord.dtype, device=self.device)
+        max_pos.scatter_reduce_(1, net_ids, scaled, reduce="amax", include_self=True)
+        max_neg.scatter_reduce_(1, net_ids, -scaled, reduce="amax", include_self=True)
+        ep = torch.exp((scaled - max_pos.gather(1, net_ids)).clamp(min=-60.0, max=60.0))
+        en = torch.exp((-scaled - max_neg.gather(1, net_ids)).clamp(min=-60.0, max=60.0))
+        sump = torch.zeros((batch, num_nets), dtype=coord.dtype, device=self.device).scatter_add_(1, net_ids, ep)
+        sumn = torch.zeros((batch, num_nets), dtype=coord.dtype, device=self.device).scatter_add_(1, net_ids, en)
+        xep = torch.zeros((batch, num_nets), dtype=coord.dtype, device=self.device).scatter_add_(1, net_ids, coord * ep)
+        xen = torch.zeros((batch, num_nets), dtype=coord.dtype, device=self.device).scatter_add_(1, net_ids, coord * en)
+        return xep / sump.clamp_min(1.0e-12) - xen / sumn.clamp_min(1.0e-12)
+
+    def _batched_density_loss(
+        self,
+        placements,
+        benchmark,
+        sizes,
+        rows: int,
+        cols: int,
+        target_density: float,
+        grid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if rows * cols <= 1:
+            return placements.new_zeros((placements.shape[0],))
+        if grid is None:
+            xs = torch.linspace(0, float(benchmark.canvas_width), cols + 1, device=self.device, dtype=placements.dtype)
+            ys = torch.linspace(0, float(benchmark.canvas_height), rows + 1, device=self.device, dtype=placements.dtype)
+            x0 = xs[:-1].view(1, cols).expand(rows, cols)
+            x1 = xs[1:].view(1, cols).expand(rows, cols)
+            y0 = ys[:-1].view(rows, 1).expand(rows, cols)
+            y1 = ys[1:].view(rows, 1).expand(rows, cols)
+            grid = torch.stack((x0, y0, x1, y1), dim=2).reshape(rows * cols, 4)
+        half = sizes / 2
+        boxes = torch.stack(
+            [
+                placements[:, :, 0] - half[:, 0].view(1, -1),
+                placements[:, :, 1] - half[:, 1].view(1, -1),
+                placements[:, :, 0] + half[:, 0].view(1, -1),
+                placements[:, :, 1] + half[:, 1].view(1, -1),
+            ],
+            dim=2,
+        )
+        x_overlap = (
+            torch.minimum(boxes[:, :, 2].unsqueeze(2), grid[:, 2].view(1, 1, -1))
+            - torch.maximum(boxes[:, :, 0].unsqueeze(2), grid[:, 0].view(1, 1, -1))
+        ).clamp_min(0)
+        y_overlap = (
+            torch.minimum(boxes[:, :, 3].unsqueeze(2), grid[:, 3].view(1, 1, -1))
+            - torch.maximum(boxes[:, :, 1].unsqueeze(2), grid[:, 1].view(1, 1, -1))
+        ).clamp_min(0)
+        bin_area = (float(benchmark.canvas_width) / cols) * (float(benchmark.canvas_height) / rows)
+        density = (x_overlap * y_overlap).sum(dim=1) / max(bin_area, 1.0e-9)
+        overflow = (density - float(target_density)).clamp_min(0)
+        k = max(int(overflow.shape[1] * 0.10), 1)
+        return torch.topk(overflow.square(), k=k, dim=1).values.mean(dim=1)
+
+    def _batched_soft_route_congestion_loss(self, placements, benchmark, ctx, rows: int, cols: int) -> torch.Tensor:
+        batch = placements.shape[0]
+        pair_count = int(ctx.routing_weights.numel())
+        if pair_count == 0 or rows * cols <= 1 or self.config.soft_route_congestion_weight <= 0:
+            return placements.new_zeros((batch,))
+        src = self._batched_pin_positions(
+            placements,
+            ctx.routing_src_parent,
+            ctx.routing_src_offset,
+            ctx.routing_src_port_pos,
+            ctx.routing_src_is_port,
+        )
+        dst = self._batched_pin_positions(
+            placements,
+            ctx.routing_dst_parent,
+            ctx.routing_dst_offset,
+            ctx.routing_dst_port_pos,
+            ctx.routing_dst_is_port,
+        )
+        grid_w = float(benchmark.canvas_width) / max(cols, 1)
+        grid_h = float(benchmark.canvas_height) / max(rows, 1)
+        tau_x = max(grid_w * float(self.config.soft_route_tau_scale), 1.0e-3)
+        tau_y = max(grid_h * float(self.config.soft_route_tau_scale), 1.0e-3)
+        col_centers = torch.linspace(grid_w * 0.5, float(benchmark.canvas_width) - grid_w * 0.5, cols, device=self.device, dtype=placements.dtype)
+        row_centers = torch.linspace(grid_h * 0.5, float(benchmark.canvas_height) - grid_h * 0.5, rows, device=self.device, dtype=placements.dtype)
+        h = placements.new_zeros((batch, rows, cols))
+        v = placements.new_zeros((batch, rows, cols))
+        chunk_size = max(int(self.config.soft_route_chunk_size), 1)
+        weights_all = ctx.routing_weights.to(dtype=placements.dtype)
+        for start_idx in range(0, pair_count, chunk_size):
+            end = min(start_idx + chunk_size, pair_count)
+            src_c = src[:, start_idx:end, :]
+            dst_c = dst[:, start_idx:end, :]
+            weights = weights_all[start_idx:end].view(1, end - start_idx, 1, 1)
+            x_min = torch.minimum(src_c[:, :, 0], dst_c[:, :, 0]).unsqueeze(2)
+            x_max = torch.maximum(src_c[:, :, 0], dst_c[:, :, 0]).unsqueeze(2)
+            y_min = torch.minimum(src_c[:, :, 1], dst_c[:, :, 1]).unsqueeze(2)
+            y_max = torch.maximum(src_c[:, :, 1], dst_c[:, :, 1]).unsqueeze(2)
+            h_window = torch.sigmoid((col_centers.view(1, 1, cols) - x_min) / tau_x) * torch.sigmoid((x_max - col_centers.view(1, 1, cols)) / tau_x)
+            v_window = torch.sigmoid((row_centers.view(1, 1, rows) - y_min) / tau_y) * torch.sigmoid((y_max - row_centers.view(1, 1, rows)) / tau_y)
+            h_row = torch.softmax(-0.5 * ((row_centers.view(1, 1, rows) - src_c[:, :, 1].unsqueeze(2)) / tau_y).square(), dim=2)
+            v_col = torch.softmax(-0.5 * ((col_centers.view(1, 1, cols) - dst_c[:, :, 0].unsqueeze(2)) / tau_x).square(), dim=2)
+            h = h + (weights * h_row.unsqueeze(3) * h_window.unsqueeze(2)).sum(dim=1)
+            v = v + (weights * v_window.unsqueeze(3) * v_col.unsqueeze(2)).sum(dim=1)
+        grid_v_routes = max(grid_w * float(benchmark.vroutes_per_micron), 1.0e-9)
+        grid_h_routes = max(grid_h * float(benchmark.hroutes_per_micron), 1.0e-9)
+        h = self._batched_smooth_h(h / grid_h_routes, int(ctx.smooth_range))
+        v = self._batched_smooth_v(v / grid_v_routes, int(ctx.smooth_range))
+        pressure = torch.cat([v.reshape(batch, -1), h.reshape(batch, -1)], dim=1)
+        overflow = (pressure - float(self.config.congestion_target)).clamp_min(0).square()
+        k = max(int(overflow.shape[1] * 0.10), 1)
+        return torch.topk(overflow, k=k, dim=1).values.mean(dim=1)
+
+    def _batched_smooth_v(self, v: torch.Tensor, smooth_range: int) -> torch.Tensor:
+        r = max(int(smooth_range), 0)
+        if r == 0:
+            return v
+        _, _, cols = v.shape
+        out = torch.zeros_like(v)
+        for col in range(cols):
+            lp = max(0, col - r)
+            rp = min(cols - 1, col + r)
+            out[:, :, lp : rp + 1] += v[:, :, col : col + 1] / float(rp - lp + 1)
+        return out
+
+    def _batched_smooth_h(self, h: torch.Tensor, smooth_range: int) -> torch.Tensor:
+        r = max(int(smooth_range), 0)
+        if r == 0:
+            return h
+        _, rows, _ = h.shape
+        out = torch.zeros_like(h)
+        for row in range(rows):
+            lp = max(0, row - r)
+            rp = min(rows - 1, row + r)
+            out[:, lp : rp + 1, :] += h[:, row : row + 1, :] / float(rp - lp + 1)
+        return out
+
+    def _batched_boundary_loss(self, placements, benchmark, sizes) -> torch.Tensor:
+        half = sizes / 2
+        left = (half[:, 0].view(1, -1) - placements[:, :, 0]).clamp_min(0)
+        right = (placements[:, :, 0] + half[:, 0].view(1, -1) - float(benchmark.canvas_width)).clamp_min(0)
+        bottom = (half[:, 1].view(1, -1) - placements[:, :, 1]).clamp_min(0)
+        top = (placements[:, :, 1] + half[:, 1].view(1, -1) - float(benchmark.canvas_height)).clamp_min(0)
+        return (left + right + bottom + top).sum(dim=1) / max(float(benchmark.canvas_width) + float(benchmark.canvas_height), 1.0e-9)
 
     def _soft_relax_one(
         self,
@@ -502,6 +805,8 @@ class DreamPlaceHybridOptimizer:
         for idx in official_order:
             cand = candidates[idx]
             official = compute_proxy_cost(cand, benchmark, plc)
+            self._metric_add("official_evals", 1)
+            self._metric_add("soft_relax_official_evals", 1)
             if int(official["overlap_count"]) == 0 and float(official["proxy_cost"]) < best_score:
                 print(f"[dreamplace_gpu] soft_relax lr={lr_scale:.6g} proxy={float(official['proxy_cost']):.6f}")
                 out.append(cand)
@@ -521,6 +826,8 @@ class DreamPlaceHybridOptimizer:
         stacked = torch.stack([cand.to(self.device, dtype=torch.float32) for cand in candidates])
         with torch.no_grad():
             costs = evaluator.evaluate_batch(stacked)
+            self._metric_add("torch_eval_batches", 1)
+            self._metric_add("torch_eval_candidates", len(candidates))
             score = torch.where(
                 costs.is_legal & (costs.official_proxy < best_score),
                 costs.official_proxy,
@@ -546,6 +853,8 @@ class DreamPlaceHybridOptimizer:
         stacked = torch.stack([cand.to(self.device, dtype=torch.float32) for cand in candidates])
         with torch.no_grad():
             costs = evaluator.evaluate_batch(stacked)
+            self._metric_add("torch_eval_batches", 1)
+            self._metric_add("torch_eval_candidates", len(candidates))
             score = torch.where(
                 costs.is_legal,
                 costs.search_score,
@@ -626,7 +935,7 @@ class DreamPlaceHybridOptimizer:
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n >= 580:
-            return 0
+            return min(limit, 1)
         if n >= 380:
             return min(limit, 1)
         if total >= 1200:
@@ -642,11 +951,11 @@ class DreamPlaceHybridOptimizer:
         n = int(benchmark.num_hard_macros)
         total = int(benchmark.num_macros)
         if n >= 700:
-            return 0
+            return min(budget, 2)
         if total >= 1200:
-            return 0
+            return min(budget, 2)
         if n >= 580:
-            return min(budget, 8)
+            return min(budget, 4)
         if n >= 380:
             if total <= 1600:
                 return min(budget, 8)
@@ -680,11 +989,15 @@ class DreamPlaceHybridOptimizer:
         evaluator = TorchProxyCostEvaluator(ctx, overlap_weight=1000.0, boundary_weight=1000.0)
         if throughput:
             best_costs = evaluator.evaluate_batch(best.to(self.device, dtype=torch.float32))
+            self._metric_add("torch_eval_batches", 1)
+            self._metric_add("torch_eval_candidates", 1)
             if not bool(best_costs.is_legal.item()):
                 return None
             best_score = float(best_costs.official_proxy.item())
         else:
             best_costs = compute_proxy_cost(best, benchmark, plc)
+            self._metric_add("official_evals", 1)
+            self._metric_add("official_refine_official_evals", 1)
             if int(best_costs["overlap_count"]) != 0:
                 return None
             best_score = float(best_costs["proxy_cost"])
@@ -719,6 +1032,7 @@ class DreamPlaceHybridOptimizer:
             if official_budget <= 0:
                 break
             keep = official_budget
+            verify_top_k = self._official_refine_verify_top_k(benchmark, keep)
             use_cheap_prefilter = int(self.config.official_refine_full_prefilter_factor) > 0
             cheap_scored: list[tuple[float, tuple[int, float, float, float]]] = []
             all_specs: list[tuple[int, float, float, float]] = []
@@ -762,12 +1076,12 @@ class DreamPlaceHybridOptimizer:
             if not scored:
                 break
             scored.sort(key=lambda item: item[0])
-            order = [spec for _, spec in scored[:keep]]
+            order = [spec for _, spec in scored[:verify_top_k]]
 
             round_best = best
             round_best_score = best_score
             if throughput:
-                for score, spec in scored[:keep]:
+                for score, spec in scored[:verify_top_k]:
                     if score < round_best_score:
                         round_best = self._materialize_official_refine_candidate(best, spec, benchmark)
                         round_best_score = float(score)
@@ -777,6 +1091,8 @@ class DreamPlaceHybridOptimizer:
                 for spec in order:
                     cand = self._materialize_official_refine_candidate(best, spec, benchmark)
                     official = compute_proxy_cost(cand, benchmark, plc)
+                    self._metric_add("official_evals", 1)
+                    self._metric_add("official_refine_official_evals", 1)
                     official_budget -= 1
                     if int(official["overlap_count"]) != 0:
                         continue
@@ -799,6 +1115,20 @@ class DreamPlaceHybridOptimizer:
             return best
         return None
 
+    def _official_refine_verify_top_k(self, benchmark, budget: int) -> int:
+        limit = max(1, int(self.config.official_refine_verify_top_k))
+        if not self.config.adaptive_large_budget:
+            return min(limit, max(int(budget), 1))
+        if self._throughput_mode():
+            return min(limit, max(int(budget), 1))
+        n = int(benchmark.num_hard_macros)
+        total = int(benchmark.num_macros)
+        if n >= 580 or total >= 1200:
+            return min(limit, max(int(budget), 1), 4)
+        if n >= 380:
+            return min(limit, max(int(budget), 1), 6)
+        return min(limit, max(int(budget), 1))
+
     def _official_refine_cheap_scores(
         self,
         candidates: torch.Tensor,
@@ -807,11 +1137,11 @@ class DreamPlaceHybridOptimizer:
         evaluator: TorchProxyCostEvaluator,
     ) -> torch.Tensor:
         overlap_legal = self._official_refine_overlap_legal(candidates, specs, benchmark)
-        wirelength = evaluator._wirelength(candidates)
-        boundary = evaluator._boundary_violation(candidates)
-        fixed = evaluator._fixed_violation(candidates)
-        legal = overlap_legal & (boundary <= evaluator.gap) & (fixed <= evaluator.gap)
-        score = wirelength + evaluator.boundary_weight * (boundary + fixed)
+        costs = evaluator.evaluate_batch(candidates, check_overlap=False)
+        self._metric_add("torch_eval_batches", 1)
+        self._metric_add("torch_eval_candidates", candidates.shape[0])
+        legal = costs.is_legal & overlap_legal
+        score = costs.search_score
         return torch.where(legal, score, torch.full_like(score, torch.inf))
 
     def _score_official_refine_full(
@@ -831,6 +1161,8 @@ class DreamPlaceHybridOptimizer:
                 stacked = self._build_official_refine_chunk(base, chunk_specs, sizes, benchmark)
                 overlap_legal = self._official_refine_overlap_legal(stacked, chunk_specs, benchmark)
                 costs = evaluator.evaluate_batch(stacked, check_overlap=False)
+                self._metric_add("torch_eval_batches", 1)
+                self._metric_add("torch_eval_candidates", stacked.shape[0])
                 legal = costs.is_legal & overlap_legal
                 search_score = torch.where(
                     legal,
@@ -962,6 +1294,8 @@ class DreamPlaceHybridOptimizer:
         for idx in candidate_order:
             pos = candidates[idx]
             costs = compute_proxy_cost(pos, benchmark, plc)
+            self._metric_add("official_evals", 1)
+            self._metric_add("rank_official_evals", 1)
             score = float(costs["proxy_cost"]) if int(costs["overlap_count"]) == 0 else float("inf")
             rows[idx] = (score, pos)
         return sorted(rows, key=lambda item: item[0])
@@ -999,6 +1333,8 @@ class DreamPlaceHybridOptimizer:
                 chunk = candidates[start : start + batch_limit]
                 stacked = torch.stack([c.to(self.device, dtype=torch.float32) for c in chunk])
                 costs = evaluator.evaluate_batch(stacked)
+                self._metric_add("torch_eval_batches", 1)
+                self._metric_add("torch_eval_candidates", len(chunk))
                 chunk_scores = torch.where(
                     costs.is_legal,
                     costs.official_proxy,
@@ -1538,4 +1874,3 @@ class DreamPlaceAnalyticalOptimizer:
         placement[:, 1].clamp_(sizes[:, 1] / 2, float(benchmark.canvas_height) - sizes[:, 1] / 2)
         if bool(fixed.any()):
             placement[fixed] = original[fixed]
-

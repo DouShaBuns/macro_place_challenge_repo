@@ -50,3 +50,30 @@ def test_internal_official_switch_disables_official_ranking():
     config = module.DreamPlaceConfig(official_final_only=True)
     opt = module.DreamPlaceHybridOptimizer(config=config, device="cpu")
     assert opt._internal_official_enabled() is False
+
+
+def test_large_case_official_refine_verify_budget_is_capped():
+    module = _load_optimizer_module()
+    config = module.DreamPlaceConfig(
+        adaptive_large_budget=True,
+        official_refine_verify_top_k=8,
+    )
+    opt = module.DreamPlaceHybridOptimizer(config=config, device="cpu")
+    benchmark = types.SimpleNamespace(num_hard_macros=700, num_macros=1500)
+
+    assert opt._official_refine_verify_top_k(benchmark, budget=24) == 4
+
+
+def test_adaptive_large_case_keeps_late_stage_floor():
+    module = _load_optimizer_module()
+    config = module.DreamPlaceConfig(
+        adaptive_large_budget=True,
+        soft_relax_official_eval_limit=4,
+        official_refine_evals=24,
+    )
+    opt = module.DreamPlaceHybridOptimizer(config=config, device="cpu")
+    benchmark = types.SimpleNamespace(num_hard_macros=700, num_macros=1500)
+
+    assert opt._large_case_soft_iters(benchmark) > 0
+    assert opt._large_case_soft_official_eval_limit(benchmark) == 1
+    assert opt._large_case_official_refine_budget(benchmark) == 2

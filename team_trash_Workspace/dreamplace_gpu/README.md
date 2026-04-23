@@ -19,7 +19,6 @@
 |------|------|
 | `team_trash_Workspace/dreamplace_gpu/placer.py` | challenge placer 入口，解析 `DP_*` 环境变量 |
 | `team_trash_Workspace/dreamplace_gpu/optimizer.py` | 主优化流程：analytical、soft relax、official rerank、local refine |
-| `team_trash_Workspace/dreamplace_gpu/parallel_runner.py` | 单 benchmark / 小批量运行器，支持保存 JSONL 和串接 ORFS |
 | `team_trash_Workspace/dreamplace_gpu/global_scheduler.py` | 全局调度器，支持 GPU backfill、pause/resume、checkpoint |
 | `team_trash_Workspace/dreamplace_gpu/benchmark_context.py` | 构建 net / routing 上下文并缓存 PLC |
 | `team_trash_Workspace/dreamplace_gpu/trace_utils.py` | 过程 trace、GIF、placement snapshot |
@@ -66,7 +65,7 @@ output/traces/dreamplace_gpu/<benchmark>/placements/
 
 当前默认逻辑是：
 
-- `parallel_runner.py` / `global_scheduler.py` 在 ORFS 验证时默认设置  
+- `global_scheduler.py` 在 ORFS 验证时默认设置  
   `DP_RUNNER_ORFS_SKIP_SYNTHESIS=1`
 - `scripts/evaluate_with_orfs.py` 默认也优先走 `--skip-synthesis`
 
@@ -84,22 +83,21 @@ DP_RUNNER_ORFS_SKIP_SYNTHESIS=0
 
 ## 运行方式
 
-### 单个 benchmark
+### IBM 全量默认配置
 
 ```bash
-DP_DEVICE=cuda:0 \
-uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py \
-  --benchmarks ibm01 \
-  --out team_trash_Workspace/dreamplace_gpu/results/ibm01.jsonl
-```
-
-### IBM 全量
-
-```bash
-DP_DEVICE=cuda:0 \
-uv run python team_trash_Workspace/dreamplace_gpu/parallel_runner.py \
+DP_RESOURCE_MODE=throughput \
+DP_OFFICIAL_FINAL_ONLY=1 \
+DP_CHECKPOINT_BACKEND=shm \
+DP_BATCHED_SOFT_RELAX=1 \
+DP_SAVE_FINAL_PLACEMENT=0 \
+uv run --python 3.12 python team_trash_Workspace/dreamplace_gpu/global_scheduler.py \
   --all \
-  --out team_trash_Workspace/dreamplace_gpu/results/ibm_full.jsonl
+  --out team_trash_Workspace/dreamplace_gpu/results/full_shm_preempt_batched_compare.jsonl \
+  --work-dir team_trash_Workspace/dreamplace_gpu/results/full_shm_preempt_batched_compare_work \
+  --max-gpu-jobs 1 \
+  --max-gpu-burst-jobs 2 \
+  --schedule large-first
 ```
 
 IBM 这组主要看：
@@ -109,6 +107,28 @@ IBM 这组主要看：
 - `runtime`
 
 它不走 ORFS，也不输出 `WNS/TNS/Area`。
+
+默认 IBM 全量必须使用 `global_scheduler.py`。内部 runner 不作为文档化
+运行入口，也不能代替默认全量；这里需要的是全局调度器提供的 GPU
+backfill、pause/resume 和 shm checkpoint。
+
+这个默认配置对应 `full_shm_preempt_20260422T221418Z.jsonl` 这一类
+speed-first 全量实验：
+
+- `DP_RESOURCE_MODE=throughput`：使用 speed-first / GPU 批量搜索路径
+- `DP_OFFICIAL_FINAL_ONLY=1`：关闭内部 official rerank/refine，只做最终 official proxy
+- `DP_CHECKPOINT_BACKEND=shm`：将可恢复 checkpoint 写到 `/dev/shm/dreamplace_gpu/`
+- `DP_BATCHED_SOFT_RELAX=1`：启用 batched soft-relax lane
+- `--max-gpu-burst-jobs 2`：GPU 空闲时允许 backfill worker 抢占式填充
+- `--schedule large-first`：优先启动大 case，给小 case 留作 backfill
+
+调度器日志中如果出现类似下面的行，说明 pause/resume 机制生效：
+
+```text
+paused ... checkpoint=/dev/shm/dreamplace_gpu/...ckpt.pt
+```
+
+注意：`/dev/shm` 是内存文件系统，实例关机或重启后 checkpoint 会丢失。
 
 ### NG45 全量 + ORFS 验证
 
@@ -218,7 +238,7 @@ DP_PAUSE_REQUEST_PATH
 
 ## 结果文件格式
 
-`parallel_runner.py` / `global_scheduler.py` 输出 JSONL，每行一个 benchmark。
+`global_scheduler.py` 输出 JSONL，每行一个 benchmark。
 
 常见字段：
 
