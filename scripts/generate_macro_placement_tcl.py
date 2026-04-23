@@ -125,6 +125,14 @@ def _plc_extract_group_and_index(plc_name):
     return prefix, macro_idx
 
 
+def _plc_direct_to_odb_name(plc_name):
+    """Convert a direct .plc instance path to the ODB-style instance name."""
+    odb_name = re.sub(r'\[(\d+)\]\.', r'_\1__', plc_name)
+    odb_name = re.sub(r'\[(\d+)\]$', r'_\1__', odb_name)
+    odb_name = odb_name.replace('.', '_')
+    return odb_name
+
+
 def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area=None):
     """
     Write macro placement in ORFS format using place_macro command.
@@ -176,7 +184,7 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
             group_data[group_prefix][macro_k] = (x_ll, y_ll, orientation, plc_name)
             total_macros += 1
         else:
-            direct_data.append((plc_name, x_ll, y_ll, orientation))
+            direct_data.append((plc_name, _plc_direct_to_odb_name(plc_name), x_ll, y_ll, orientation))
             total_macros += 1
 
     with open(output_file, 'w') as f:
@@ -195,9 +203,12 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
                 f.write(f'dict set _gpd "{group_prefix}" {k} [list {x_ll:.6f} {y_ll:.6f} {orient} "{plc_name}"]\n')
         f.write("\n")
         f.write("set _direct_macros [list]\n")
-        for plc_name, x_ll, y_ll, orient in direct_data:
-            escaped_name = plc_name.replace("\\", "\\\\").replace('"', '\\"')
-            f.write(f'lappend _direct_macros [list "{escaped_name}" {x_ll:.6f} {y_ll:.6f} {orient}]\n')
+        for plc_name, odb_name, x_ll, y_ll, orient in direct_data:
+            escaped_plc_name = plc_name.replace("\\", "\\\\").replace('"', '\\"')
+            escaped_odb_name = odb_name.replace("\\", "\\\\").replace('"', '\\"')
+            f.write(
+                f'lappend _direct_macros [list "{escaped_plc_name}" "{escaped_odb_name}" {x_ll:.6f} {y_ll:.6f} {orient}]\n'
+            )
         f.write("\n")
 
         # TCL matching logic
@@ -224,11 +235,20 @@ set _unmatched_plc [list]
 
 # Pass 0: Direct-name placements for macros whose .plc names are already usable
 foreach item $_direct_macros {
-    lassign $item direct_name x y orient
-    if {[catch {place_macro -macro_name [list $direct_name] -location [list $x $y] -orientation $orient} err]} {
-        lappend _unmatched_plc "$direct_name (direct) :: $err"
-    } else {
-        incr _placed
+    lassign $item plc_name odb_name x y orient
+    set _direct_ok 0
+    foreach candidate [list $odb_name $plc_name] {
+        if {$candidate eq ""} {
+            continue
+        }
+        if {![catch {place_macro -macro_name [list $candidate] -location [list $x $y] -orientation $orient} err]} {
+            incr _placed
+            set _direct_ok 1
+            break
+        }
+    }
+    if {!$_direct_ok} {
+        lappend _unmatched_plc "$plc_name (direct) :: $err"
     }
 }
 

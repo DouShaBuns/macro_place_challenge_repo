@@ -18,11 +18,13 @@ Usage:
 import sys
 import json
 import argparse
+import os
 import shutil
 import subprocess
 import tarfile
 import resource
 import re
+import urllib.request
 import torch
 from pathlib import Path
 
@@ -61,8 +63,8 @@ def get_top_module_name(benchmark_name: str, verilog_file: Path) -> str:
         'ariane133_ng45': 'ariane',
         'ariane136_ng45': 'ariane',
         'ariane136_asap7': 'ariane',
-        'nvdla_ng45': 'NV_nvdla',
-        'nvdla_asap7': 'NV_nvdla',
+        'nvdla_ng45': 'NV_NVDLA_partition_c',
+        'nvdla_asap7': 'NV_NVDLA_partition_c',
         'mempool_tile_ng45': 'mempool_tile',
         'mempool_tile_asap7': 'mempool_tile',
         'bp_quad_ng45': 'black_parrot',
@@ -97,16 +99,10 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
     print(f"Running ORFS flow for {tech}/{design_name}...")
 
     # Build command with docker_shell wrapper if requested
-    if use_docker:
-        cmd = [
-            "util/docker_shell",
-            "make",
-            f"DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk",
-            "finish"  # Run through detailed routing
-        ]
-    else:
+    if not use_docker:
         cmd = [
             "make",
+            f"PLATFORM={tech}",
             f"DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk",
             "finish"
         ]
@@ -125,6 +121,26 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
 
     print(f"  Logs: {stdout_log}")
     print(f"         {stderr_log}")
+
+    launcher_script = None
+    if use_docker:
+        launcher_script = log_dir / "run_orfs.sh"
+        launcher_script.write_text(
+            "\n".join([
+                "#!/usr/bin/env bash",
+                "set -ex",
+                "cd /work",
+                "export FLOW_HOME=/work",
+                f"make PLATFORM={tech} DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk finish",
+                "",
+            ])
+        )
+        launcher_script.chmod(0o755)
+        cmd = [
+            "util/docker_shell",
+            "bash",
+            f"/work/designs/{tech}/{design_name}/eval_logs/run_orfs.sh",
+        ]
 
     with open(stdout_log, 'w') as fout, open(stderr_log, 'w') as ferr:
         try:
@@ -189,6 +205,20 @@ def parse_orfs_results(flow_dir: Path, tech: str, design_name: str) -> dict:
         metrics_file = Path(tmp.name)
 
     try:
+        env = os.environ.copy()
+        orfs_root = flow_dir.parent
+        openroad_exe = orfs_root / "tools" / "install" / "OpenROAD" / "bin" / "openroad"
+        yosys_exe = orfs_root / "tools" / "install" / "yosys" / "bin" / "yosys"
+        if openroad_exe.exists():
+            env["OPENROAD_EXE"] = str(openroad_exe)
+        elif "OPENROAD_EXE" not in env:
+            version_stub = flow_dir / ".codex_openroad_version.sh"
+            version_stub.write_text("#!/usr/bin/env bash\necho 'OpenROAD unknown'\n", encoding="utf-8")
+            version_stub.chmod(0o755)
+            env["OPENROAD_EXE"] = str(version_stub)
+        if yosys_exe.exists():
+            env["YOSYS_EXE"] = str(yosys_exe)
+
         # Run genMetrics.py (use relative paths since cwd=flow_dir)
         cmd = [
             'python3',
@@ -201,7 +231,7 @@ def parse_orfs_results(flow_dir: Path, tech: str, design_name: str) -> dict:
             '--output', str(metrics_file)
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=flow_dir)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=flow_dir, env=env)
 
         if result.returncode == 0 and metrics_file.exists():
             with open(metrics_file) as f:
@@ -298,6 +328,45 @@ def _copy_first(existing: list[Path], destination: Path) -> Path | None:
     return dst
 
 
+def _collect_fakeram_cells(verilog_file: Path) -> list[str]:
+    if not verilog_file.exists():
+        return []
+    refs = sorted(set(re.findall(r"fakeram45_\d+x\d+", verilog_file.read_text(encoding="utf-8", errors="ignore"))))
+    return refs
+
+
+def _ensure_platform_fakeram_assets(orfs_root: Path, tech: str, cell_names: list[str]) -> tuple[list[str], list[str]]:
+    if tech != "nangate45":
+        return [], []
+
+    platform_dir = orfs_root / "flow" / "platforms" / tech
+    lef_dir = platform_dir / "lef"
+    lib_dir = platform_dir / "lib"
+    lef_dir.mkdir(parents=True, exist_ok=True)
+    lib_dir.mkdir(parents=True, exist_ok=True)
+
+    lef_refs = []
+    lib_refs = []
+    for cell in cell_names:
+        lef_path = lef_dir / f"{cell}.lef"
+        lib_path = lib_dir / f"{cell}.lib"
+        if not lef_path.exists():
+            urllib.request.urlretrieve(
+                f"https://raw.githubusercontent.com/siliconcompiler/lambdapdk/main/lambdapdk/freepdk45/libs/fakeram45/lef/{cell}.lef",
+                lef_path,
+            )
+        if not lib_path.exists():
+            urllib.request.urlretrieve(
+                f"https://raw.githubusercontent.com/siliconcompiler/lambdapdk/main/lambdapdk/freepdk45/libs/fakeram45/nldm/{cell}.lib",
+                lib_path,
+            )
+        if lef_path.exists():
+            lef_refs.append(f"$(PLATFORM_DIR)/lef/{cell}.lef")
+        if lib_path.exists():
+            lib_refs.append(f"$(PLATFORM_DIR)/lib/{cell}.lib")
+    return lef_refs, lib_refs
+
+
 def _create_basic_orfs_design(
     benchmark_name: str,
     source_name: str,
@@ -339,6 +408,9 @@ def _create_basic_orfs_design(
             missing.append("sdc")
         raise FileNotFoundError(f"missing fallback ORFS inputs: {', '.join(missing)}")
 
+    fakeram_cells = _collect_fakeram_cells(copied_verilog)
+    platform_fakeram_lefs, platform_fakeram_libs = _ensure_platform_fakeram_assets(orfs_root, tech, fakeram_cells)
+
     die_w = round(float(benchmark.canvas_width), 2)
     die_h = round(float(benchmark.canvas_height), 2)
     core_margin_x = 10.07
@@ -362,11 +434,15 @@ def _create_basic_orfs_design(
         "export MACRO_PLACE_HALO = 8 8",
         "export MACRO_PLACEMENT_TCL = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/macros.tcl",
     ]
-    if copied_lefs:
-        lef_expr = " ".join(f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_lefs)
+    additional_lefs = [f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_lefs]
+    additional_lefs.extend(platform_fakeram_lefs)
+    if additional_lefs:
+        lef_expr = " ".join(additional_lefs)
         lines.append(f"export ADDITIONAL_LEFS = {lef_expr}")
-    if copied_libs:
-        lib_expr = " ".join(f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_libs)
+    additional_libs = [f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_libs]
+    additional_libs.extend(platform_fakeram_libs)
+    if additional_libs:
+        lib_expr = " ".join(additional_libs)
         lines.append(f"export ADDITIONAL_LIBS = {lib_expr}")
     lines.append("")
 
@@ -770,6 +846,9 @@ def main():
         return 1
 
     args.output.mkdir(parents=True, exist_ok=True)
+    summary_file = args.output / "evaluation_summary.json"
+    if summary_file.exists():
+        summary_file.unlink()
 
     # Evaluate all
     all_results = []
@@ -785,7 +864,6 @@ def main():
         all_results.append(result)
 
         # Save incremental results
-        summary_file = args.output / "evaluation_summary.json"
         with open(summary_file, 'w') as f:
             json.dump(all_results, f, indent=2)
 
