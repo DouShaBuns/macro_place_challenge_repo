@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import sys
 from pathlib import Path
@@ -41,6 +42,54 @@ def _parse_float_tuple(text: str | None, default: tuple[float, ...]) -> tuple[fl
     return values
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _safe_name(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text).strip("_") or "benchmark"
+
+
+def _save_final_placement(placement: torch.Tensor, benchmark) -> dict[str, str]:
+    if not _env_bool("DP_SAVE_FINAL_PLACEMENT", True):
+        return {}
+
+    name = _safe_name(str(getattr(benchmark, "name", "benchmark")))
+    out_dir = Path(os.getenv("DP_PLACEMENT_DIR", "output/dreamplace_gpu/placements"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    placement_cpu = placement.detach().cpu()
+    tensor_path = out_dir / f"{name}.pt"
+    csv_path = out_dir / f"{name}.csv"
+    torch.save(placement_cpu, tensor_path)
+
+    sizes = getattr(benchmark, "macro_sizes", None)
+    fixed = getattr(benchmark, "macro_fixed", None)
+    num_hard = int(getattr(benchmark, "num_hard_macros", placement_cpu.shape[0]))
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["macro_index", "x_center", "y_center", "width", "height", "fixed"])
+        for idx in range(min(num_hard, placement_cpu.shape[0])):
+            width = float(sizes[idx, 0].item()) if sizes is not None else ""
+            height = float(sizes[idx, 1].item()) if sizes is not None else ""
+            is_fixed = bool(fixed[idx].item()) if fixed is not None else ""
+            writer.writerow(
+                [
+                    idx,
+                    float(placement_cpu[idx, 0].item()),
+                    float(placement_cpu[idx, 1].item()),
+                    width,
+                    height,
+                    is_fixed,
+                ]
+            )
+
+    return {"placement_pt": str(tensor_path), "placement_csv": str(csv_path)}
+
+
 class DreamPlaceGPUPlacer:
     def __init__(self):
         seed_text = os.getenv("DP_SEEDS", "42,43,44,45")
@@ -48,8 +97,6 @@ class DreamPlaceGPUPlacer:
         recipes = _parse_recipes(os.getenv("DP_RECIPES"))
         self.config = DreamPlaceConfig(
             analytical_iters=int(os.getenv("DP_ANALYTICAL_ITERS", "80")),
-            refine_iters=int(os.getenv("DP_REFINE_ITERS", "80")),
-            refine_candidate_batch=int(os.getenv("DP_REFINE_CANDIDATE_BATCH", "16")),
             seeds=seeds,
             density_weight=float(os.getenv("DP_DENSITY_WEIGHT", "0.18")),
             congestion_weight=float(os.getenv("DP_CONGESTION_WEIGHT", "0.05")),
@@ -62,7 +109,6 @@ class DreamPlaceGPUPlacer:
             overlap_weight=float(os.getenv("DP_OVERLAP_WEIGHT", "18.0")),
             boundary_weight=float(os.getenv("DP_BOUNDARY_WEIGHT", "25.0")),
             optimize_soft_macros=os.getenv("DP_OPTIMIZE_SOFT", "1") != "0",
-            run_refine=os.getenv("DP_RUN_REFINE", "0") != "0",
             top_k_candidates=int(os.getenv("DP_TOP_K_CANDIDATES", "8")),
             official_rerank_limit=int(os.getenv("DP_OFFICIAL_RERANK_LIMIT", "0")),
             max_gpu_batch_candidates=int(os.getenv("DP_MAX_GPU_BATCH_CANDIDATES", "0")),
@@ -96,9 +142,11 @@ class DreamPlaceGPUPlacer:
         )
         self.device = os.getenv("DP_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
         self.last_profile: dict[str, float] = {}
+        self.last_placement_paths: dict[str, str] = {}
 
     def place(self, benchmark):
         optimizer = DreamPlaceHybridOptimizer(self.config, device=self.device)
         placement = optimizer.optimize(benchmark)
         self.last_profile = dict(getattr(optimizer, "last_profile", {}))
+        self.last_placement_paths = _save_final_placement(placement, benchmark)
         return placement

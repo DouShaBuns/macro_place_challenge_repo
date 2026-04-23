@@ -26,8 +26,6 @@ from macro_place.objective import compute_overlap_metrics, compute_proxy_cost  #
 @dataclass
 class DreamPlaceConfig:
     analytical_iters: int = 260
-    refine_iters: int = 80
-    refine_candidate_batch: int = 16
     seeds: tuple[int, ...] = (42, 43, 44, 45)
     density_weight: float = 0.18
     congestion_weight: float = 0.05
@@ -44,7 +42,6 @@ class DreamPlaceConfig:
     learning_rate: float = 0.035
     bin_grid_cap: int = 48
     optimize_soft_macros: bool = True
-    run_refine: bool = False
     top_k_candidates: int = 8
     official_rerank_limit: int = 0
     max_gpu_batch_candidates: int = 0
@@ -317,23 +314,7 @@ class DreamPlaceHybridOptimizer:
                     reranked = self._rank_candidates(starts + [official_local], benchmark, ctx)
                 starts = [pos for _, pos in reranked[: max(1, min(self.config.top_k_candidates, len(reranked)))]]
             checkpoint.checkpoint_and_maybe_pause("search_done", starts=starts)
-        if not self.config.run_refine or self.config.refine_iters <= 0:
-            result = starts[0].cpu()
-            if trace is not None:
-                with profile.stage("trace_close"):
-                    trace.record(result, "final")
-                    trace.close()
-            profile.finish()
-            checkpoint.cleanup()
-            return result
-
-        with profile.stage("sa_refine"):
-            refiner = AnalyticalSARefiner(self.config, self.device, ctx)
-            refined = refiner.refine(benchmark, starts)
-        all_final = starts + refined
-        with profile.stage("rank_final_torch" if not self._internal_official_enabled() else "rank_final_official"):
-            ranked_final = self._rank_candidates(all_final, benchmark, ctx)
-        result = ranked_final[0][1].cpu()
+        result = starts[0].cpu()
         if trace is not None:
             with profile.stage("trace_close"):
                 trace.record(result, "final")
@@ -1558,163 +1539,3 @@ class DreamPlaceAnalyticalOptimizer:
         if bool(fixed.any()):
             placement[fixed] = original[fixed]
 
-
-class AnalyticalSARefiner:
-    def __init__(self, config: DreamPlaceConfig, device: torch.device, ctx):
-        self.config = config
-        self.device = device
-        self.ctx = ctx
-
-    def refine(self, benchmark, starts: list[torch.Tensor]) -> list[torch.Tensor]:
-        evaluator = TorchProxyCostEvaluator(self.ctx, overlap_weight=1000.0, boundary_weight=1000.0)
-        seeds = tuple(int(s) for s in self.config.seeds)
-        state = []
-        for i, seed in enumerate(seeds):
-            base = starts[i % len(starts)].to(self.device, dtype=torch.float32)
-            state.append(base)
-        state_t = torch.stack(state, dim=0)
-        self._restore_fixed(state_t, benchmark)
-        current = evaluator.evaluate_batch(state_t)
-        best_pos = state_t.clone()
-        best_cost = torch.where(current.is_legal, current.official_proxy, torch.full_like(current.official_proxy, torch.inf))
-        top_pos, top_score = self._add_top(None, None, state_t, current.search_score)
-
-        for step in range(max(int(self.config.refine_iters), 0)):
-            temp = self._temperature(step)
-            candidates = self._generate_candidates(state_t, benchmark, seeds, step, temp)
-            flat = candidates.reshape(-1, benchmark.num_macros, 2)
-            cand_cost = evaluator.evaluate_batch(flat)
-            top_pos, top_score = self._add_top(top_pos, top_score, flat, cand_cost.search_score)
-            c = int(self.config.refine_candidate_batch)
-            score = cand_cost.search_score.reshape(len(seeds), c)
-            official = cand_cost.official_proxy.reshape(len(seeds), c)
-            legal = cand_cost.is_legal.reshape(len(seeds), c)
-            delta = score - current.search_score.view(-1, 1)
-            accept = (delta <= 0) | (torch.rand_like(delta) < torch.exp((-delta / max(temp, 1.0e-9)).clamp(max=60.0)))
-            masked_score = torch.where(accept, score, torch.full_like(score, torch.inf))
-            chosen_score, chosen = masked_score.min(dim=1)
-            has_accept = torch.isfinite(chosen_score)
-            if bool(has_accept.any()):
-                row = torch.arange(len(seeds), device=self.device)
-                chosen_flat = row * c + chosen
-                new_state = flat[chosen_flat]
-                state_t = torch.where(has_accept.view(-1, 1, 1), new_state, state_t)
-                current = evaluator.evaluate_batch(state_t)
-            legal_better = legal & (official < best_cost.view(-1, 1))
-            if bool(legal_better.any()):
-                masked = torch.where(legal_better, official, torch.full_like(official, torch.inf))
-                _, best_idx = masked.min(dim=1)
-                row = torch.arange(len(seeds), device=self.device)
-                any_better = legal_better.any(dim=1)
-                best_flat = row * c + best_idx
-                best_pos = torch.where(any_better.view(-1, 1, 1), flat[best_flat], best_pos)
-                best_cost = torch.where(any_better, official[row, best_idx], best_cost)
-
-        finals = []
-        for pos in best_pos.detach().cpu():
-            finals.append(clamp_placement(legalize_placement(pos, benchmark, gap=0.01), benchmark))
-        if top_pos is not None:
-            keep = min(int(top_pos.shape[0]), self.config.top_k_candidates)
-            for pos in top_pos[:keep].detach().cpu():
-                finals.append(clamp_placement(legalize_placement(pos, benchmark, gap=0.01), benchmark))
-        return finals
-
-    def _temperature(self, step: int) -> float:
-        start = 0.045
-        end = 0.0008
-        if self.config.refine_iters <= 1:
-            return end
-        frac = step / float(self.config.refine_iters - 1)
-        return start * ((end / start) ** frac)
-
-    def _generate_candidates(self, state: torch.Tensor, benchmark, seeds, step: int, temp: float) -> torch.Tensor:
-        s, n, _ = state.shape
-        c = int(self.config.refine_candidate_batch)
-        candidates = state.unsqueeze(1).repeat(1, c, 1, 1).reshape(s * c, n, 2)
-        sizes = benchmark.macro_sizes.to(self.device, dtype=torch.float32)
-        movable = (benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()).to(self.device)
-        movable_idx = torch.where(movable)[0]
-        if movable_idx.numel() == 0:
-            return candidates.reshape(s, c, n, 2)
-        total = s * c
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed((sum(int(x) for x in seeds) + 1000003 * (step + 1)) % (2**63 - 1))
-        move_types = torch.randint(0, 5, (total,), device=self.device, generator=generator)
-        chosen_i = movable_idx[torch.randint(0, movable_idx.numel(), (total,), device=self.device, generator=generator)]
-        chosen_j = movable_idx[torch.randint(0, movable_idx.numel(), (total,), device=self.device, generator=generator)]
-        scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height)) * max(temp, 1.0e-4)
-        noise = torch.randn((total, 2), device=self.device, generator=generator) * scale
-        rows = torch.arange(total, device=self.device)
-
-        move_mask = move_types == 0
-        if bool(move_mask.any()):
-            candidates[rows[move_mask], chosen_i[move_mask]] += noise[move_mask]
-
-        swap_mask = (move_types == 1) & (chosen_i != chosen_j)
-        if bool(swap_mask.any()):
-            swap_rows = rows[swap_mask]
-            i = chosen_i[swap_mask]
-            j = chosen_j[swap_mask]
-            old_i = candidates[swap_rows, i].clone()
-            candidates[swap_rows, i] = candidates[swap_rows, j]
-            candidates[swap_rows, j] = old_i
-
-        attract_mask = (move_types == 2) & (chosen_i != chosen_j)
-        if bool(attract_mask.any()):
-            attract_rows = rows[attract_mask]
-            i = chosen_i[attract_mask]
-            j = chosen_j[attract_mask]
-            alpha = 0.08 + 0.30 * torch.rand((int(attract_rows.numel()), 1), device=self.device, generator=generator)
-            candidates[attract_rows, i] = candidates[attract_rows, i] + alpha * (
-                candidates[attract_rows, j] - candidates[attract_rows, i]
-            )
-
-        random_mask = move_types == 3
-        if bool(random_mask.any()):
-            random_rows = rows[random_mask]
-            i = chosen_i[random_mask]
-            random_xy = torch.rand((int(random_rows.numel()), 2), device=self.device, generator=generator)
-            random_xy[:, 0] *= float(benchmark.canvas_width)
-            random_xy[:, 1] *= float(benchmark.canvas_height)
-            candidates[random_rows, i] = random_xy
-
-        perm_mask = move_types == 4
-        if bool(perm_mask.any()):
-            k = min(5, int(movable_idx.numel()))
-            perm_rows = rows[perm_mask]
-            if k > 1:
-                rand = torch.rand((int(perm_rows.numel()), int(movable_idx.numel())), device=self.device, generator=generator)
-                perm_src_pos = rand.topk(k=k, dim=1, largest=False).indices
-                perm_src = movable_idx[perm_src_pos]
-                dst_order = torch.rand((int(perm_rows.numel()), k), device=self.device, generator=generator).argsort(dim=1)
-                perm_dst = perm_src.gather(1, dst_order)
-                candidates[perm_rows.unsqueeze(1), perm_src] = candidates[perm_rows.unsqueeze(1), perm_dst].clone()
-        half = sizes / 2
-        candidates[:, :, 0] = candidates[:, :, 0].clamp(half[:, 0], float(benchmark.canvas_width) - half[:, 0])
-        candidates[:, :, 1] = candidates[:, :, 1].clamp(half[:, 1], float(benchmark.canvas_height) - half[:, 1])
-        self._restore_fixed(candidates, benchmark)
-        return candidates.reshape(s, c, n, 2)
-
-    def _restore_fixed(self, placements: torch.Tensor, benchmark) -> None:
-        fixed = benchmark.macro_fixed.to(self.device)
-        if bool(fixed.any()):
-            orig = benchmark.macro_positions.to(self.device, dtype=placements.dtype)
-            placements[:, fixed, :] = orig[fixed]
-
-    def _add_top(self, top_pos, top_score, candidates: torch.Tensor, scores: torch.Tensor):
-        k = max(int(self.config.top_k_candidates), 0)
-        if k == 0:
-            return top_pos, top_score
-        pos = candidates.reshape(-1, candidates.shape[-2], candidates.shape[-1]).detach()
-        score = scores.reshape(-1).detach()
-        finite = torch.isfinite(score)
-        if not bool(finite.any()):
-            return top_pos, top_score
-        pos = pos[finite]
-        score = score[finite]
-        if top_pos is not None and top_score is not None:
-            pos = torch.cat([top_pos, pos], dim=0)
-            score = torch.cat([top_score, score], dim=0)
-        keep = min(k, int(score.numel()))
-        _, idx = torch.topk(score, k=keep, largest=False)
-        return pos[idx].clone(), score[idx].clone()

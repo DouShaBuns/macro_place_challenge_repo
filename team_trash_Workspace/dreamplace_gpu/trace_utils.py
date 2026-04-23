@@ -22,6 +22,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _save_intermediate_enabled() -> bool:
+    return _env_bool("DP_SAVE_INTERMEDIATE_PLACEMENTS", False) or _env_bool("SAVE_INTERMEDIATE_PLACEMENTS", False)
+
+
 def _safe_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_") or "trace"
 
@@ -47,6 +51,10 @@ class PlacementTraceRecorder:
         self.root.mkdir(parents=True, exist_ok=True)
         self.frames_dir = self.root / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
+        self.save_tensors = _save_intermediate_enabled()
+        self.tensors_dir = self.root / "placements"
+        if self.save_tensors:
+            self.tensors_dir.mkdir(parents=True, exist_ok=True)
         self.gif_path = self.root / f"{self.method}_{_safe_name(getattr(benchmark, 'name', 'benchmark'))}.gif"
         self._frame_paths: list[Path] = []
 
@@ -55,6 +63,7 @@ class PlacementTraceRecorder:
         enabled = _env_bool("TRACE_PLACEMENT", False) or _env_bool("PLACEMENT_TRACE", False)
         method_key = method.upper().replace("-", "_")
         enabled = enabled or _env_bool(f"{method_key}_TRACE", False)
+        enabled = enabled or _save_intermediate_enabled()
         if not enabled:
             return None
         return cls(
@@ -72,7 +81,10 @@ class PlacementTraceRecorder:
 
     def record(self, placement: torch.Tensor, label: str) -> None:
         path = self.frames_dir / f"{len(self._frame_paths):04d}_{_safe_name(label)}.png"
-        _render_frame(placement.detach().cpu(), self.benchmark, path, str(label), self.dpi)
+        placement_cpu = placement.detach().cpu()
+        if self.save_tensors:
+            torch.save(placement_cpu, self.tensors_dir / f"{len(self._frame_paths):04d}_{_safe_name(label)}.pt")
+        _render_frame(placement_cpu, self.benchmark, path, str(label), self.dpi)
         self._frame_paths.append(path)
 
     def close(self) -> Optional[Path]:
