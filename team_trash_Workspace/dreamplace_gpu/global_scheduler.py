@@ -13,8 +13,12 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from macro_place.evaluate import IBM_BENCHMARKS, NG45_BENCHMARKS  # noqa: E402
+from macro_place.evaluate import IBM_BENCHMARKS  # noqa: E402
 from macro_place.loader import load_benchmark, load_benchmark_from_dir  # noqa: E402
+from benchmark_context import NG45_BENCHMARK_DIRS  # noqa: E402
+
+
+NG45_BENCHMARKS = {name: path for name, path in NG45_BENCHMARK_DIRS.items() if name.endswith("_ng45")}
 
 
 @dataclass(frozen=True)
@@ -105,8 +109,23 @@ def main() -> None:
     )
     parser.add_argument("--poll-interval", type=float, default=float(os.getenv("DP_SCHED_POLL_INTERVAL", "10")))
     parser.add_argument("--schedule", choices=("large-first", "small-first", "input"), default="large-first")
+    parser.add_argument(
+        "--orfs-validate",
+        action="store_true",
+        default=os.getenv("DP_RUNNER_ORFS_VALIDATE", "0") not in {"0", "false", "False"},
+        help="Run ORFS validation after each finished NG45/ASAP7 benchmark and merge WNS/TNS/Area into the result row.",
+    )
+    parser.add_argument("--orfs-root", default=os.getenv("DP_RUNNER_ORFS_ROOT", "../OpenROAD-flow-scripts"))
+    parser.add_argument("--orfs-output-dir", default=os.getenv("DP_RUNNER_ORFS_OUTPUT_DIR", "output/orfs_evaluation"))
+    parser.add_argument("--orfs-no-docker", action="store_true", default=os.getenv("DP_RUNNER_ORFS_NO_DOCKER", "0") not in {"0", "false", "False"})
+    parser.add_argument("--orfs-skip-synthesis", action="store_true", default=os.getenv("DP_RUNNER_ORFS_SKIP_SYNTHESIS", "1") not in {"0", "false", "False"})
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    os.environ["DP_RUNNER_ORFS_VALIDATE"] = "1" if args.orfs_validate else "0"
+    os.environ["DP_RUNNER_ORFS_ROOT"] = str(Path(args.orfs_root))
+    os.environ["DP_RUNNER_ORFS_OUTPUT_DIR"] = str(Path(args.orfs_output_dir))
+    os.environ["DP_RUNNER_ORFS_NO_DOCKER"] = "1" if args.orfs_no_docker else "0"
+    os.environ["DP_RUNNER_ORFS_SKIP_SYNTHESIS"] = "1" if args.orfs_skip_synthesis else "0"
 
     names = _select_benchmarks(args)
     infos = [_benchmark_info(name) for name in names]
@@ -174,7 +193,7 @@ def _select_benchmarks(args) -> list[str]:
     if args.benchmarks:
         return list(args.benchmarks)
     if args.ng45:
-        return list(NG45_BENCHMARKS.keys())
+        return sorted(NG45_BENCHMARKS.keys())
     if args.all:
         return list(IBM_BENCHMARKS)
     return ["ibm01"]
@@ -390,7 +409,6 @@ def _stage_is_gpu_heavy(stage: str | None) -> bool:
         "analytical",
         "soft_relax",
         "official_refine",
-        "sa_refine",
         "place",
     }
 

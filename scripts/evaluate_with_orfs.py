@@ -20,6 +20,7 @@ import json
 import argparse
 import shutil
 import subprocess
+import tarfile
 import resource
 import re
 import torch
@@ -40,8 +41,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from benchmark import Benchmark
 from loader import load_benchmark_from_dir
 from objective import compute_proxy_cost
-from orfs_integration.design_generator import create_orfs_design, ORFSDesign
 from generate_macro_placement_tcl import write_orfs_macro_placement
+
+try:
+    from orfs_integration.design_generator import create_orfs_design, ORFSDesign
+except ModuleNotFoundError:
+    create_orfs_design = None
+    ORFSDesign = None
 
 
 def get_top_module_name(benchmark_name: str, verilog_file: Path) -> str:
@@ -237,6 +243,137 @@ def parse_orfs_results(flow_dir: Path, tech: str, design_name: str) -> dict:
     return metrics
 
 
+def _prepare_external_orfs_config(source_root: Path, source_name: str) -> Path | None:
+    openroad_root = source_root / "scripts" / "OpenROAD"
+    direct_dir = openroad_root / source_name
+    if direct_dir.exists():
+        return direct_dir
+
+    archives = sorted(openroad_root.glob("*.tar.gz"))
+    for archive in archives:
+        with tarfile.open(archive, "r:gz") as tar:
+            members = tar.getmembers()
+            top_levels = []
+            for member in members:
+                parts = Path(member.name).parts
+                if not parts:
+                    continue
+                if len(parts) >= 2 and parts[0] == "home":
+                    top_levels.append(parts[-2] if member.isdir() else parts[-2])
+                else:
+                    top_levels.append(parts[0])
+            candidates = {name for name in top_levels if name}
+            if source_name not in candidates and not any(source_name in member.name for member in members):
+                continue
+
+        extract_root = openroad_root / ".extracted"
+        target_dir = extract_root / source_name
+        if target_dir.exists():
+            return target_dir
+
+        extract_root.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "r:gz") as tar:
+            for member in tar.getmembers():
+                member_path = Path(member.name)
+                parts = member_path.parts
+                if not parts:
+                    continue
+                if source_name not in parts:
+                    continue
+                idx = parts.index(source_name)
+                relative_name = Path(*parts[idx:])
+                member.name = relative_name.as_posix()
+                tar.extract(member, path=extract_root)
+        if target_dir.exists():
+            return target_dir
+    return None
+
+
+def _copy_first(existing: list[Path], destination: Path) -> Path | None:
+    if not existing:
+        return None
+    src = existing[0]
+    dst = destination / src.name
+    shutil.copy(src, dst)
+    return dst
+
+
+def _create_basic_orfs_design(
+    benchmark_name: str,
+    source_name: str,
+    tech: str,
+    top_module: str,
+    source_root: Path,
+    source_dir: Path,
+    benchmark: Benchmark,
+    orfs_root: Path,
+) -> Path:
+    design_dir = orfs_root / "flow" / "designs" / tech / source_name
+    if design_dir.exists():
+        shutil.rmtree(design_dir)
+    design_dir.mkdir(parents=True, exist_ok=True)
+
+    verilog_candidates = sorted(source_dir.glob("*.v")) + sorted(source_dir.parent.glob("*.v"))
+    sdc_candidates = sorted((source_root / "constraints").glob("*.sdc"))
+    lef_candidates = sorted(source_root.glob("**/*.lef"))
+    lib_candidates = sorted(source_root.glob("**/*.lib"))
+
+    copied_verilog = _copy_first(verilog_candidates, design_dir)
+    copied_sdc = _copy_first(sdc_candidates, design_dir)
+    copied_lefs = []
+    for lef in lef_candidates:
+        copied = _copy_first([lef], design_dir)
+        if copied is not None:
+            copied_lefs.append(copied.name)
+    copied_libs = []
+    for lib in lib_candidates:
+        copied = _copy_first([lib], design_dir)
+        if copied is not None:
+            copied_libs.append(copied.name)
+
+    if copied_verilog is None or copied_sdc is None:
+        missing = []
+        if copied_verilog is None:
+            missing.append("verilog")
+        if copied_sdc is None:
+            missing.append("sdc")
+        raise FileNotFoundError(f"missing fallback ORFS inputs: {', '.join(missing)}")
+
+    die_w = round(float(benchmark.canvas_width), 2)
+    die_h = round(float(benchmark.canvas_height), 2)
+    core_margin_x = 10.07
+    core_margin_y = 9.94
+    core_w = max(core_margin_x + 10.0, die_w - core_margin_x)
+    core_h = max(core_margin_y + 10.0, die_h - core_margin_y)
+
+    lines = [
+        f"export DESIGN_NICKNAME = {source_name}",
+        f"export DESIGN_NAME = {top_module}",
+        f"export PLATFORM    = {tech}",
+        "",
+        f"export VERILOG_FILES = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{copied_verilog.name}",
+        f"export SDC_FILE      = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{copied_sdc.name}",
+        "export SYNTH_NETLIST_FILES = $(VERILOG_FILES)",
+        "export REMOVE_ABC_BUFFERS = 1",
+        "export SKIP_RTLMP = 1",
+        f"export DIE_AREA    = 0.0 0.0 {die_w} {die_h}",
+        f"export CORE_AREA   = {core_margin_x} {core_margin_y} {core_w} {core_h}",
+        "export PLACE_DENSITY_LB_ADDON ?= 0.10",
+        "export MACRO_PLACE_HALO = 8 8",
+        "export MACRO_PLACEMENT_TCL = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/macros.tcl",
+    ]
+    if copied_lefs:
+        lef_expr = " ".join(f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_lefs)
+        lines.append(f"export ADDITIONAL_LEFS = {lef_expr}")
+    if copied_libs:
+        lib_expr = " ".join(f"./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/{name}" for name in copied_libs)
+        lines.append(f"export ADDITIONAL_LIBS = {lib_expr}")
+    lines.append("")
+
+    (design_dir / "config.mk").write_text("\n".join(lines), encoding="utf-8")
+    return design_dir
+
+
 def evaluate_benchmark(
     benchmark_name: str,
     orfs_root: Path,
@@ -246,6 +383,7 @@ def evaluate_benchmark(
     placement_path: Path = None
 ) -> dict:
     """Evaluate a single benchmark."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*80}")
     print(f"Evaluating: {benchmark_name}")
     print(f"{'='*80}")
@@ -302,15 +440,17 @@ def evaluate_benchmark(
 
     # Path to their OpenROAD scripts directory
     if tech == "nangate45":
-        orfs_config_dir = Path(f"external/MacroPlacement/Flows/NanGate45/{source_name}/scripts/OpenROAD/{source_name}")
+        source_root = Path(f"external/MacroPlacement/Flows/NanGate45/{source_name}")
+        orfs_config_dir = _prepare_external_orfs_config(source_root, source_name)
     else:
-        orfs_config_dir = Path(f"external/MacroPlacement/Flows/ASAP7/{source_name}/scripts/OpenROAD/{source_name}")
+        source_root = Path(f"external/MacroPlacement/Flows/ASAP7/{source_name}")
+        orfs_config_dir = _prepare_external_orfs_config(source_root, source_name)
 
     # Fallback: check ORFS built-in designs (maps source_name to ORFS design name)
     orfs_builtin_map = {
         'bp_quad': 'black_parrot',
     }
-    if not orfs_config_dir.exists() and source_name in orfs_builtin_map:
+    if (orfs_config_dir is None or not orfs_config_dir.exists()) and source_name in orfs_builtin_map:
         orfs_design_name_builtin = orfs_builtin_map[source_name]
         builtin_dir = orfs_root / "flow" / "designs" / tech / orfs_design_name_builtin
         if builtin_dir.exists():
@@ -318,7 +458,7 @@ def evaluate_benchmark(
             # Use the ORFS design name for consistency
             source_name = orfs_design_name_builtin
 
-    if orfs_config_dir.exists():
+    if orfs_config_dir is not None and orfs_config_dir.exists():
         print(f"  ✓ Found existing ORFS config: {orfs_config_dir}")
 
         # Use their original design name to keep paths consistent
@@ -506,7 +646,7 @@ def evaluate_benchmark(
         print(f"  ✓ Using our macro placement: {tcl_file.name}")
     else:
         print(f"  ⚠️  No existing config found at {orfs_config_dir}")
-        print(f"  Generating basic config (may not work)")
+        print(f"  Generating basic config")
 
         # Fallback to generated config
         verilog_files = list(source_dir.glob("*.v"))
@@ -521,23 +661,37 @@ def evaluate_benchmark(
         write_orfs_macro_placement(placement, benchmark, plc, str(tcl_file))
 
         top_module = get_top_module_name(benchmark_name, verilog_files[0])
-        design = ORFSDesign(
-            name=benchmark_name,
-            tech=tech,
-            verilog_files=verilog_files,
-            macro_placement_tcl=tcl_file,
-            clock_period=4.0,  # Match their 4ns
-            core_utilization=0.65,
-            top_module=top_module
-        )
-        design_dir = create_orfs_design(design, orfs_root, source_dir)
+        if create_orfs_design is not None and ORFSDesign is not None:
+            design = ORFSDesign(
+                name=benchmark_name,
+                tech=tech,
+                verilog_files=verilog_files,
+                macro_placement_tcl=tcl_file,
+                clock_period=4.0,
+                core_utilization=0.65,
+                top_module=top_module
+            )
+            design_dir = create_orfs_design(design, orfs_root, source_dir)
+        else:
+            source_root = source_dir.parent.parent
+            design_dir = _create_basic_orfs_design(
+                benchmark_name=benchmark_name,
+                source_name=source_name,
+                tech=tech,
+                top_module=top_module,
+                source_root=source_root,
+                source_dir=source_dir,
+                benchmark=benchmark,
+                orfs_root=orfs_root,
+            )
+            shutil.copy(tcl_file, design_dir / "macros.tcl")
 
     # 4. Run ORFS flow
     print("\n[4/4] Running OpenROAD-flow-scripts...")
     print("  (This may take 20-40 minutes per benchmark)")
 
     # Use source_name for the ORFS design if we copied their config
-    if orfs_config_dir.exists():
+    if orfs_config_dir is not None and orfs_config_dir.exists():
         # Update config to point to correct design
         orfs_design_name = source_name
     else:
@@ -551,7 +705,7 @@ def evaluate_benchmark(
         m = re.search(r'DESIGN_NICKNAME\s*=\s*(\S+)', config_path.read_text())
         if m:
             nickname = m.group(1)
-    stale_names = {orfs_design_name, nickname} if orfs_config_dir.exists() else {benchmark_name}
+    stale_names = {orfs_design_name, nickname} if (orfs_config_dir is not None and orfs_config_dir.exists()) else {benchmark_name}
     for subdir in ["results", "logs", "objects"]:
         for sname in stale_names:
             stale = orfs_root / "flow" / subdir / tech / sname
@@ -588,8 +742,8 @@ def main():
                        help='Output directory')
     parser.add_argument('--no-docker', action='store_true',
                        help='Run without Docker (use native ORFS installation)')
-    parser.add_argument('--skip-synthesis', action='store_true',
-                       help='Skip Yosys synthesis (use pre-synthesized netlist)')
+    parser.add_argument('--skip-synthesis', action='store_true', default=True,
+                       help='Skip Yosys synthesis by default and reuse the provided pre-synthesized netlist.')
     parser.add_argument('--placement', type=Path,
                        help='Path to placement tensor (.pt file) with shape [num_macros, 2]')
 
@@ -646,6 +800,10 @@ def main():
     print("-" * 115)
 
     for result in all_results:
+        if "proxy_cost" not in result:
+            err = result.get("error", "error")
+            print(f"{result.get('benchmark', result.get('name', 'unknown')):<25} ERROR: {err}")
+            continue
         orfs = result.get('orfs', {})
         wns = orfs.get('wns', 'N/A')
         tns = orfs.get('tns', 'N/A')

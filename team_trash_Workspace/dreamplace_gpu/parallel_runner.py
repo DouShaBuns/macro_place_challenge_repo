@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,10 +18,16 @@ if str(_HERE) not in sys.path:
 from optimizer import PauseRequested  # noqa: E402
 from placer import DreamPlaceGPUPlacer  # noqa: E402
 
-from macro_place.evaluate import IBM_BENCHMARKS, NG45_BENCHMARKS  # noqa: E402
+from macro_place.evaluate import IBM_BENCHMARKS  # noqa: E402
 from macro_place.loader import load_benchmark, load_benchmark_from_dir  # noqa: E402
 from macro_place.objective import compute_proxy_cost  # noqa: E402
 from macro_place.utils import validate_placement  # noqa: E402
+from benchmark_context import NG45_BENCHMARK_DIRS  # noqa: E402
+
+
+NG45_BENCHMARKS = {name: path for name, path in NG45_BENCHMARK_DIRS.items() if name.endswith("_ng45")}
+
+_ORFS_MODULE = None
 
 
 def _heartbeat_path() -> Path | None:
@@ -41,6 +48,83 @@ def _heartbeat_update(**fields) -> None:
     payload.update(fields)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _repo_root() -> Path:
+    return _HERE.parents[1]
+
+
+def _load_orfs_module():
+    global _ORFS_MODULE
+    if _ORFS_MODULE is not None:
+        return _ORFS_MODULE
+    path = _repo_root() / "scripts" / "evaluate_with_orfs.py"
+    spec = importlib.util.spec_from_file_location("dreamplace_orfs_runner", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load ORFS helper from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _ORFS_MODULE = module
+    return module
+
+
+def _orfs_enabled() -> bool:
+    return _env_bool("DP_RUNNER_ORFS_VALIDATE", False)
+
+
+def _set_orfs_env(args) -> None:
+    os.environ["DP_RUNNER_ORFS_VALIDATE"] = "1" if args.orfs_validate else "0"
+    os.environ["DP_RUNNER_ORFS_ROOT"] = str(Path(args.orfs_root))
+    os.environ["DP_RUNNER_ORFS_OUTPUT_DIR"] = str(Path(args.orfs_output_dir))
+    os.environ["DP_RUNNER_ORFS_NO_DOCKER"] = "1" if args.orfs_no_docker else "0"
+    os.environ["DP_RUNNER_ORFS_SKIP_SYNTHESIS"] = "1" if args.orfs_skip_synthesis else "0"
+
+
+def _orfs_benchmark_name(name: str) -> str:
+    if name in NG45_BENCHMARKS and "_ng45" not in name and "_asap7" not in name:
+        return f"{name}_ng45"
+    return name
+
+
+def _maybe_run_orfs(name: str, result: dict) -> dict:
+    if not _orfs_enabled() or "error" in result or result.get("paused"):
+        return result
+    benchmark_name = _orfs_benchmark_name(name)
+    if benchmark_name not in {"ariane133_ng45", "ariane136_ng45", "bp_quad_ng45", "nvdla_ng45", "mempool_tile_ng45", "ariane136_asap7", "nvdla_asap7", "mempool_tile_asap7"}:
+        return result
+    placement_path = Path(result.get("placement_paths", {}).get("placement_pt", ""))
+    if not placement_path.exists():
+        result["orfs"] = {"error": f"missing placement tensor at {placement_path}"}
+        return result
+    module = _load_orfs_module()
+    output_root = Path(os.getenv("DP_RUNNER_ORFS_OUTPUT_DIR", "output/orfs_evaluation"))
+    output_dir = output_root / benchmark_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+    _heartbeat_update(name=name, current_stage="orfs_validate", placement_path=str(placement_path))
+    eval_result = module.evaluate_benchmark(
+        benchmark_name=benchmark_name,
+        orfs_root=Path(os.getenv("DP_RUNNER_ORFS_ROOT", "../OpenROAD-flow-scripts")),
+        output_dir=output_dir,
+        use_docker=not _env_bool("DP_RUNNER_ORFS_NO_DOCKER", False),
+        skip_synthesis=_env_bool("DP_RUNNER_ORFS_SKIP_SYNTHESIS", False),
+        placement_path=placement_path,
+    )
+    elapsed = time.time() - start
+    result["orfs"] = eval_result.get("orfs", eval_result)
+    result["orfs_proxy_cost"] = float(eval_result.get("proxy_cost", result.get("proxy_cost", 0.0)))
+    result["orfs_runtime"] = float(elapsed)
+    result["orfs_output_dir"] = str(output_dir)
+    profile = result.setdefault("profile", {})
+    profile["orfs_validate"] = float(elapsed)
+    return result
 
 
 def main() -> None:
@@ -67,12 +151,41 @@ def main() -> None:
         default=os.getenv("DP_RUNNER_ISOLATE", "0") != "0",
         help="Run each benchmark in a fresh Python subprocess so CUDA memory is released after each case.",
     )
+    parser.add_argument(
+        "--orfs-validate",
+        action="store_true",
+        default=_env_bool("DP_RUNNER_ORFS_VALIDATE", False),
+        help="After each NG45/ASAP7 placement finishes, run ORFS and record WNS/TNS/Area in the same JSONL row.",
+    )
+    parser.add_argument(
+        "--orfs-root",
+        default=os.getenv("DP_RUNNER_ORFS_ROOT", "../OpenROAD-flow-scripts"),
+        help="Path to OpenROAD-flow-scripts.",
+    )
+    parser.add_argument(
+        "--orfs-output-dir",
+        default=os.getenv("DP_RUNNER_ORFS_OUTPUT_DIR", "output/orfs_evaluation"),
+        help="Directory for ORFS configs, logs, and reports.",
+    )
+    parser.add_argument(
+        "--orfs-no-docker",
+        action="store_true",
+        default=_env_bool("DP_RUNNER_ORFS_NO_DOCKER", False),
+        help="Run ORFS without docker_shell.",
+    )
+    parser.add_argument(
+        "--orfs-skip-synthesis",
+        action="store_true",
+        default=_env_bool("DP_RUNNER_ORFS_SKIP_SYNTHESIS", True),
+        help="Reuse the provided synthesized netlist inside ORFS.",
+    )
     args = parser.parse_args()
+    _set_orfs_env(args)
 
     if args.benchmarks:
         benchmarks = args.benchmarks
     elif args.ng45:
-        benchmarks = list(NG45_BENCHMARKS.keys())
+        benchmarks = sorted(NG45_BENCHMARKS.keys())
     elif args.all:
         benchmarks = IBM_BENCHMARKS
     else:
@@ -95,6 +208,7 @@ def main() -> None:
                 result = _run_one(name)
             except Exception:
                 result = {"name": name, "error": traceback.format_exc(), "runtime": 0.0}
+            result = _maybe_run_orfs(name, result)
             results.append(result)
             f.write(json.dumps(result, sort_keys=True) + "\n")
             f.flush()
@@ -120,6 +234,7 @@ def _run_parallel(benchmarks: list[str], out: Path, jobs: int, schedule: str) ->
                 for future in as_completed(futures):
                     futures.pop(future)
                     result = future.result()
+                    result = _maybe_run_orfs(result.get("name", name), result)
                     results.append(result)
                     f.write(json.dumps(result, sort_keys=True) + "\n")
                     f.flush()
@@ -174,6 +289,7 @@ def _run_isolated(benchmarks: list[str], out: Path, jobs: int, schedule: str) ->
                 if stderr.strip():
                     print(stderr.rstrip(), file=sys.stderr)
                 result = _read_child_result(name, child_out, process.returncode, stderr, time.time() - start)
+                result = _maybe_run_orfs(name, result)
                 results.append(result)
                 f.write(json.dumps(result, sort_keys=True) + "\n")
                 f.flush()
@@ -255,6 +371,7 @@ def _run_one(name: str) -> dict:
     profile["official_validate"] = float(validation_runtime)
     profile["official_cost"] = float(official_cost_runtime)
     profile["runner_place"] = float(runtime)
+    placement_paths = dict(getattr(placer, "last_placement_paths", {}))
     result = {
         "name": name,
         "proxy_cost": float(costs["proxy_cost"]),
@@ -266,6 +383,7 @@ def _run_one(name: str) -> dict:
         "violations": violations,
         "runtime": float(runtime),
         "profile": profile,
+        "placement_paths": placement_paths,
     }
     _heartbeat_update(name=name, current_stage="done", result_proxy=result["proxy_cost"], valid=result["valid"])
     return result
@@ -292,6 +410,17 @@ def _print_result(result: dict) -> None:
         f"cong={result['congestion']:.3f} overlaps={result['overlaps']} "
         f"{status} [{result['runtime']:.2f}s]"
     )
+    orfs = result.get("orfs")
+    if isinstance(orfs, dict) and orfs:
+        if "error" in orfs:
+            print(f"{'':>13} ORFS failed: {orfs['error']}")
+        else:
+            print(
+                f"{'':>13} ORFS wns={float(orfs.get('wns', 0.0)):.2f} "
+                f"tns={float(orfs.get('tns', 0.0)):.2f} "
+                f"area={float(orfs.get('area', 0.0)) / 1e6:.3f} "
+                f"[{float(result.get('orfs_runtime', 0.0)):.2f}s]"
+            )
 
 
 if __name__ == "__main__":

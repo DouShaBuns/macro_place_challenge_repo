@@ -151,6 +151,7 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
 
     # Build placement data keyed by (group_prefix, flat_macro_index)
     group_data = defaultdict(dict)  # group_prefix -> {K: (x, y, orient, plc_name)}
+    direct_data = []  # [(plc_name, x, y, orient)]
     total_macros = 0
 
     for i, macro_idx in enumerate(benchmark.hard_macro_indices):
@@ -175,7 +176,8 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
             group_data[group_prefix][macro_k] = (x_ll, y_ll, orientation, plc_name)
             total_macros += 1
         else:
-            print(f"  WARNING: Could not parse .plc name: {plc_name}")
+            direct_data.append((plc_name, x_ll, y_ll, orientation))
+            total_macros += 1
 
     with open(output_file, 'w') as f:
         f.write("# Macro Placement for OpenROAD-flow-scripts\n")
@@ -191,6 +193,11 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
             for k in sorted(group_data[group_prefix].keys()):
                 x_ll, y_ll, orient, plc_name = group_data[group_prefix][k]
                 f.write(f'dict set _gpd "{group_prefix}" {k} [list {x_ll:.6f} {y_ll:.6f} {orient} "{plc_name}"]\n')
+        f.write("\n")
+        f.write("set _direct_macros [list]\n")
+        for plc_name, x_ll, y_ll, orient in direct_data:
+            escaped_name = plc_name.replace("\\", "\\\\").replace('"', '\\"')
+            f.write(f'lappend _direct_macros [list "{escaped_name}" {x_ll:.6f} {y_ll:.6f} {orient}]\n')
         f.write("\n")
 
         # TCL matching logic
@@ -214,6 +221,16 @@ foreach inst [$block getInsts] {
 set _placed 0
 set _unmatched_odb [list]
 set _unmatched_plc [list]
+
+# Pass 0: Direct-name placements for macros whose .plc names are already usable
+foreach item $_direct_macros {
+    lassign $item direct_name x y orient
+    if {[catch {place_macro -macro_name [list $direct_name] -location [list $x $y] -orientation $orient} err]} {
+        lappend _unmatched_plc "$direct_name (direct) :: $err"
+    } else {
+        incr _placed
+    }
+}
 
 dict for {prefix entries} $_odb_groups {
     # Sort entries by genblk_idx then mem_idx (both numeric)
@@ -249,10 +266,14 @@ dict for {prefix entries} $_odb_groups {
         f.write('        puts "Unmatched ODB instances:"\n')
         f.write('        foreach u $_unmatched_odb { puts "  $u" }\n')
         f.write('    }\n')
+        f.write('    if {[llength $_unmatched_plc] > 0} {\n')
+        f.write('        puts "Unmatched PLC macros:"\n')
+        f.write('        foreach u $_unmatched_plc { puts "  $u" }\n')
+        f.write('    }\n')
         f.write("}\n")
 
     print(f"✓ Generated ORFS macro placement TCL: {output_file}")
-    print(f"  {total_macros} macros across {len(group_data)} sram groups")
+    print(f"  {total_macros} macros across {len(group_data)} sram groups and {len(direct_data)} direct-name macros")
 
 
 def main():
