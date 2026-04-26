@@ -329,6 +329,9 @@ TRACE_KEEP_FRAMES=1
 
 ```text
 DP_DEVICE
+DP_OPTIMIZER
+DP_ANALYTICAL_OPTIMIZER
+DP_SOFT_RELAX_OPTIMIZER
 DP_RESOURCE_MODE
 DP_OFFICIAL_FINAL_ONLY
 DP_ANALYTICAL_ITERS
@@ -347,6 +350,12 @@ DP_RUNNER_ORFS_SKIP_SYNTHESIS
 DP_RUNNER_ORFS_NO_DOCKER
 DP_CHECKPOINT_BACKEND
 ```
+
+`DP_OPTIMIZER` controls the PyTorch optimizer used by analytical placement and
+soft-relax. Supported values are `adam` and `nadam`; the default is `adam`.
+For stage ablations, `DP_ANALYTICAL_OPTIMIZER` and `DP_SOFT_RELAX_OPTIMIZER`
+override the optimizer for analytical placement and soft-relax respectively,
+falling back to `DP_OPTIMIZER` when unset.
 
 ## 建议的使用方式
 

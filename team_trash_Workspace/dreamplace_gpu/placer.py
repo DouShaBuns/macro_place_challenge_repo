@@ -95,7 +95,11 @@ class DreamPlaceGPUPlacer:
         seed_text = os.getenv("DP_SEEDS", "42,43,44,45")
         seeds = tuple(int(x) for x in seed_text.split(",") if x.strip())
         recipes = _parse_recipes(os.getenv("DP_RECIPES"))
+        optimizer_name = os.getenv("DP_OPTIMIZER", "adam")
         self.config = DreamPlaceConfig(
+            optimizer_name=optimizer_name,
+            analytical_optimizer_name=os.getenv("DP_ANALYTICAL_OPTIMIZER", optimizer_name),
+            soft_relax_optimizer_name=os.getenv("DP_SOFT_RELAX_OPTIMIZER", optimizer_name),
             analytical_iters=int(os.getenv("DP_ANALYTICAL_ITERS", "80")),
             seeds=seeds,
             density_weight=float(os.getenv("DP_DENSITY_WEIGHT", "0.18")),

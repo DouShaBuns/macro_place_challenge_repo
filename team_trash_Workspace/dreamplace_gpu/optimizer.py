@@ -25,6 +25,9 @@ from macro_place.objective import compute_overlap_metrics, compute_proxy_cost  #
 
 @dataclass
 class DreamPlaceConfig:
+    optimizer_name: str = "adam"
+    analytical_optimizer_name: str | None = None
+    soft_relax_optimizer_name: str | None = None
     analytical_iters: int = 260
     seeds: tuple[int, ...] = (42, 43, 44, 45)
     density_weight: float = 0.18
@@ -72,6 +75,21 @@ class DreamPlaceConfig:
         (0.18, 0.025, 0.035, 0.82),
         (0.28, 0.035, 0.030, 0.88),
     )
+
+    def __post_init__(self):
+        if self.analytical_optimizer_name is None:
+            self.analytical_optimizer_name = self.optimizer_name
+        if self.soft_relax_optimizer_name is None:
+            self.soft_relax_optimizer_name = self.optimizer_name
+
+
+def make_torch_optimizer(name: str, params, *, lr: float):
+    normalized = name.strip().lower()
+    if normalized == "adam":
+        return torch.optim.Adam(params, lr=lr)
+    if normalized == "nadam":
+        return torch.optim.NAdam(params, lr=lr)
+    raise ValueError(f"Unsupported optimizer={name!r}; expected 'adam' or 'nadam'")
 
 
 class PauseRequested(RuntimeError):
@@ -750,7 +768,7 @@ class DreamPlaceHybridOptimizer:
 
         x.requires_grad_(True)
         lr = float(lr_scale) * max(float(benchmark.canvas_width), float(benchmark.canvas_height))
-        opt = torch.optim.Adam([x], lr=lr)
+        opt = make_torch_optimizer(self.config.soft_relax_optimizer_name, [x], lr=lr)
         analytical = DreamPlaceAnalyticalOptimizer(self.config, self.device, ctx)
         best_loss = float("inf")
         snapshots: list[tuple[float, torch.Tensor]] = []
@@ -1425,7 +1443,11 @@ class DreamPlaceAnalyticalOptimizer:
 
         x = start.clone().detach().to(self.device)
         x.requires_grad_(True)
-        opt = torch.optim.Adam([x], lr=lr_scale * max(float(benchmark.canvas_width), float(benchmark.canvas_height)))
+        opt = make_torch_optimizer(
+            self.config.analytical_optimizer_name,
+            [x],
+            lr=lr_scale * max(float(benchmark.canvas_width), float(benchmark.canvas_height)),
+        )
         best = x.detach().clone()
         best_loss = float("inf")
         snapshots: list[tuple[float, torch.Tensor]] = []
